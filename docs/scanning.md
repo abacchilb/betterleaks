@@ -564,7 +564,8 @@ validation and analysis are disabled, as they are by default.
 
 ## `git`
 
-The Git source reads repository objects in-process with go-git. It never runs
+The Git source reads repository objects in-process using stable go-git v5 and
+Betterleaks' own object and pack readers. It never runs
 `git`, hooks, diff or textconv helpers, filters, SSH, or credential helpers, so
 scanning an untrusted repository cannot execute anything it configures.
 
@@ -806,6 +807,18 @@ stop the scan and mark it incomplete. `unreachable-objects` holds up to eight
 million object IDs to classify reachability; for larger repositories, use
 `objects`.
 
+Rename detection can choose different pairings when files have equal similarity
+scores. This inherited go-git behavior can change which added lines are scanned
+and occasionally change findings between runs.
+
+Local SHA-1 and SHA-256 repositories work in the same binary, without build
+tags. Reftable repositories and partial clones missing required objects are
+not supported; these produce incomplete scans rather than fetching missing
+objects. Config files are limited to 16 MiB, individual refs to 1 MiB, and
+ref directory nesting to 128 levels. Alternate traversal allows at most 4,096
+distinct object directories, including the primary store. Exceeding these
+bounds is an error.
+
 ### Storage outside the repository
 
 A `.git` file, `commondir`, or `objects/info/alternates` can point at Git storage
@@ -813,6 +826,9 @@ anywhere on disk. By default Betterleaks refuses storage outside the repository'
 directory, so a crafted repository cannot make it read, and report the secrets
 of, another repository on the same machine. Linked worktrees created with
 `git worktree add` are allowed because their main repository registers them.
+Shared refs come from the common Git directory; `refs/bisect`, `refs/rewritten`,
+and `refs/worktree` come from the selected worktree. Reflog scanning includes
+the journals of all registered worktrees.
 
 Repositories cloned with `--shared` or `--reference`, and submodule checkouts
 scanned directly, need `--allow-external-objects`. Relative alternates are not
@@ -831,6 +847,8 @@ come from `GITHUB_TOKEN`, `GITLAB_TOKEN`, or `HUGGINGFACE_TOKEN`/`HF_TOKEN`.
 Tokens are never inferred for other hosts. URLs with credentials, queries, or
 fragments are rejected, and SSH is not supported. The GitHub, GitLab, and Hugging
 Face sources clone and scan repositories the same way.
+HTTP(S) cloning currently supports SHA-1 repositories. Scan an existing local
+clone for SHA-256 repositories.
 
 Fetched packs are indexed as they download, without limiting pack size,
 object count, or object size: plain objects of any size are streamed. Objects

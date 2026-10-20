@@ -3,7 +3,30 @@ package gitobj
 import (
 	"fmt"
 	"io"
+	"strings"
+
+	"github.com/go-git/go-git/v5/plumbing"
 )
+
+// ValidateReferenceName validates a fully qualified ref, including existing
+// names that v5 incorrectly rejects: an @ component or a leading - in a branch
+// or tag. Those are accepted by Git's check-ref-format and go-git v6. Normalize
+// only those components for v5's validator; keep every other naming check.
+func ValidateReferenceName(name ReferenceName) error {
+	parts := strings.Split(name.String(), "/")
+	for n, part := range parts {
+		if part == "@" {
+			parts[n] = "x"
+		}
+		if n == 2 && (name.IsBranch() || name.IsTag()) && strings.HasPrefix(part, "-") {
+			parts[n] = "x" + part
+		}
+	}
+	if err := plumbing.ReferenceName(strings.Join(parts, "/")).Validate(); err != nil {
+		return fmt.Errorf("%w: %q", err, name)
+	}
+	return nil
+}
 
 type Reference struct {
 	name   ReferenceName

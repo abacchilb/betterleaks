@@ -12,8 +12,62 @@ import (
 
 	"github.com/betterleaks/betterleaks/v2/internal/gitobj"
 	"github.com/betterleaks/betterleaks/v2/sources/scm"
+	"github.com/go-git/go-billy/v5"
 	"github.com/stretchr/testify/require"
 )
+
+func TestWorktreePrivateReferences(t *testing.T) {
+	for _, namespace := range []string{"worktree", "bisect", "rewritten"} {
+		t.Run(namespace, func(t *testing.T) {
+			repo := initRepo(t)
+			base := commitFile(t, repo, "file", "TOKEN_BASE\n", "base")
+			local := commitFile(t, repo, "file", "TOKEN_LOCAL\n", "local")
+			gitFixture(t, repo, "reset", "--hard", base)
+			shared := commitFile(t, repo, "file", "TOKEN_MAIN\n", "main")
+			gitFixture(t, repo, "reset", "--hard", base)
+			linked := filepath.Join(t.TempDir(), "linked")
+			gitFixture(t, repo, "worktree", "add", "-qb", "linked", linked)
+			name := "refs/" + namespace + "/private"
+			gitFixture(t, repo, "update-ref", name, shared)
+			gitFixture(t, linked, "update-ref", name, local)
+			require.Equal(t, map[string]string{"TOKEN_BASE\n": "file:1", "TOKEN_LOCAL\n": "file:1"}, textOccurrences(collect(t, &Source{RepoPath: linked})))
+			require.Equal(t, map[string]string{"TOKEN_BASE\n": "file:1", "TOKEN_MAIN\n": "file:1"}, textOccurrences(collect(t, &Source{RepoPath: repo})))
+		})
+	}
+}
+
+type disappearingRefFS struct {
+	billy.Filesystem
+	remove string
+}
+
+func (f *disappearingRefFS) ReadDir(name string) ([]os.FileInfo, error) {
+	entries, err := f.Filesystem.ReadDir(name)
+	if name == "refs/heads" && f.remove != "" {
+		if err := os.Remove(f.remove); err != nil {
+			return nil, err
+		}
+		f.remove = ""
+	}
+	return entries, err
+}
+
+func TestReferenceDisappearsDuringEnumeration(t *testing.T) {
+	repo := initRepo(t)
+	id := commitFile(t, repo, "file", "TOKEN_REMAINING_REF\n", "initial")
+	gitFixture(t, repo, "update-ref", "refs/heads/removed", id)
+	r, close, err := (&Source{RepoPath: repo}).open(t.Context())
+	require.NoError(t, err)
+	defer close()
+	s := r.Storer.(*objectStorage)
+	s.fs.Filesystem = &disappearingRefFS{Filesystem: s.fs.Filesystem, remove: filepath.Join(repo, ".git", "refs", "heads", "removed")}
+	refs, err := s.IterReferences()
+	require.NoError(t, err)
+	defer refs.Close()
+	require.NotNil(t, s.refs[gitobj.HEAD])
+	require.NotNil(t, s.refs[gitobj.ReferenceName("refs/heads/"+gitFixture(t, repo, "branch", "--show-current"))])
+	require.NotContains(t, s.refs, gitobj.ReferenceName("refs/heads/removed"))
+}
 
 func TestAlternateObjectDirectories(t *testing.T) {
 	for _, packed := range []bool{false, true} {
@@ -136,11 +190,13 @@ func TestRepositoryExtensions(t *testing.T) {
 		valid               bool
 	}{
 		{"0", "", true}, {"1", "", true}, {"2", "", false},
+		{"01", "", true}, {"1", "objectFormat = SHA1", true},
 		{"1", "objectFormat = sha256", true}, {"0", "objectFormat = sha256", false},
 		{"1", "objectFormat = unknown", false}, {"1", "refStorage = reftable", false},
 		{"1", "preciousObjects = true", false}, {"0", "noop = anything", true},
 		{"1", "noop-v1 = anything", true}, {"0", "noop-v1 = anything", false},
 		{"0", "worktreeConfig = true", true}, {"1", "relativeWorktrees = true", true},
+		{"0", "worktreeConfig = 1", true}, {"0", "worktreeConfig = invalid", false},
 		{"0", "relativeWorktrees = true", false}, {"1", "unknown = true", false},
 	} {
 		raw := fmt.Sprintf("[core]\nrepositoryFormatVersion = %s\n[extensions]\n%s\n", tc.version, tc.extensions)
@@ -165,18 +221,29 @@ func TestWorktreeConfigOverlay(t *testing.T) {
 	gitFixture(t, repo, "worktree", "add", "-qb", "linked", linked)
 	gitFixture(t, linked, "config", "--worktree", "remote.origin.url", "https://gitlab.com/example/linked")
 	gitFixture(t, linked, "config", "--worktree", "branch.linked.remote", "origin")
-	for _, path := range []string{repo, linked} {
-		r, close, err := (&Source{RepoPath: path}).open(t.Context())
-		require.NoError(t, err)
-		cfg, err := r.Config()
-		require.NoError(t, err)
-		want := "https://github.com/example/shared"
-		if path == linked {
-			want = "https://gitlab.com/example/linked"
-			require.Equal(t, "origin", cfg.Branches["linked"].Remote)
-		}
-		require.Equal(t, []string{want}, cfg.Remotes["origin"].URLs)
-		require.Equal(t, []string{"https://github.com/example/keep"}, cfg.Remotes["keep"].URLs)
-		close()
+	for _, tc := range []struct {
+		value   string
+		enabled bool
+	}{
+		{"true", true}, {"TRUE", true}, {"1", true}, {"yes", true}, {"on", true}, {"-2", true},
+		{"false", false}, {"0", false}, {"no", false}, {"off", false},
+	} {
+		t.Run(tc.value, func(t *testing.T) {
+			gitFixture(t, repo, "config", "extensions.worktreeConfig", tc.value)
+			for _, path := range []string{repo, linked} {
+				r, close, err := (&Source{RepoPath: path}).open(t.Context())
+				require.NoError(t, err)
+				cfg, err := r.Config()
+				require.NoError(t, err)
+				want := "https://github.com/example/shared"
+				if path == linked && tc.enabled {
+					want = "https://gitlab.com/example/linked"
+					require.Equal(t, "origin", cfg.Branches["linked"].Remote)
+				}
+				require.Equal(t, []string{want}, cfg.Remotes["origin"].URLs)
+				require.Equal(t, []string{"https://github.com/example/keep"}, cfg.Remotes["keep"].URLs)
+				close()
+			}
+		})
 	}
 }

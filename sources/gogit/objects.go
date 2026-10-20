@@ -21,6 +21,9 @@ type objectStorage struct {
 	refsOnce   sync.Once
 	refs       map[gitobj.ReferenceName]*gitobj.Reference
 	refsErr    error
+	packedOnce sync.Once
+	packedRefs map[gitobj.ReferenceName]*gitobj.Reference
+	packedErr  error
 	objects    *objectCache
 	ctx        context.Context
 	limit      int64

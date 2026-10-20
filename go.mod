@@ -72,6 +72,7 @@ require (
 
 require (
 	github.com/betterleaks/go-re2 v1.11.0-betterleaks.3
+	github.com/go-git/gcfg/v2 v2.0.2
 	github.com/lucasjones/reggen v0.0.0-20200904144131-37ba4fa293bb
 	github.com/spf13/afero v1.15.0 // indirect
 	golang.org/x/sync v0.23.0

@@ -2,12 +2,16 @@
 package scm
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
 	"maps"
 	"net/http"
 	"net/http/cgi"
 	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -240,6 +244,44 @@ func TestCloneFromHTTP2Server(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestCloneWithoutProgressUsesRawPack(t *testing.T) {
+	remote, run := cloneTestRemote(t, false)
+	tree := run("", "mktree")
+	commit := run("", "commit-tree", tree, "-m", "root")
+	run("", "update-ref", "refs/heads/trunk", commit)
+	target, err := url.Parse(remote)
+	require.NoError(t, err)
+	target.Path = ""
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	var uploads atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Error(err)
+				http.Error(w, "request read failed", http.StatusBadRequest)
+				return
+			}
+			_ = r.Body.Close()
+			if bytes.Contains(body, []byte("side-band")) || !bytes.Contains(body, []byte("no-progress")) {
+				t.Error("a no-progress clone must negotiate the raw pack stream")
+			}
+			r.Body = io.NopCloser(bytes.NewReader(body))
+			uploads.Add(1)
+		}
+		proxy.ServeHTTP(w, r)
+	}))
+	defer server.Close()
+	dest := filepath.Join(t.TempDir(), "clone")
+	require.NoError(t, CloneAuthed(t.Context(), server.URL+"/repo.git", "", dest, CloneOptions{}))
+	require.Positive(t, uploads.Load())
+	repo, err := git.PlainOpen(dest)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, repo.Storer.(*filesystem.Storage).Close()) })
+	_, err = repo.CommitObject(plumbing.NewHash(commit))
+	require.NoError(t, err)
+}
+
 func TestCloneRefSelection(t *testing.T) {
 	remote, run := cloneTestRemote(t, false)
 	commit := func(name, parent string) (plumbing.Hash, plumbing.Hash) {
@@ -266,6 +308,10 @@ func TestCloneRefSelection(t *testing.T) {
 		"refs/tags/annotated":   plumbing.NewHash(run("", "rev-parse", "refs/tags/annotated")),
 		"refs/notes/commits":    plumbing.NewHash(run("", "rev-parse", "refs/notes/commits")),
 	}
+	for _, name := range []string{"refs/heads/@", "refs/heads/-existing", "refs/tags/-existing", "refs/tags/@"} {
+		run("", "update-ref", name, main.String())
+		wanted[plumbing.ReferenceName(name)] = main
+	}
 	additional := map[plumbing.ReferenceName]plumbing.Hash{}
 	blobs := map[plumbing.ReferenceName]plumbing.Hash{}
 	for _, name := range []string{
@@ -287,6 +333,7 @@ func TestCloneRefSelection(t *testing.T) {
 		extra   []plumbing.ReferenceName
 	}{
 		{name: "default"},
+		{name: "existing unusual names", options: CloneOptions{Refs: []string{"refs/heads/@", "refs/heads/-existing", "refs/tags/-existing", "refs/tags/@"}}},
 		{name: "one PR", options: CloneOptions{Refs: []string{"refs/pull/1/head"}}, extra: []plumbing.ReferenceName{"refs/pull/1/head"}},
 		{name: "PR heads", options: CloneOptions{Refs: []string{"refs/pull/*/head"}}, extra: []plumbing.ReferenceName{"refs/pull/1/head", "refs/pull/2/head"}},
 		{name: "repeated and overlapping", options: CloneOptions{Refs: []string{"refs/pull/*/head", "refs/pull/1/head", "refs/pull/1/head", "refs/custom/private"}}, extra: []plumbing.ReferenceName{"refs/pull/1/head", "refs/pull/2/head", "refs/custom/private"}},

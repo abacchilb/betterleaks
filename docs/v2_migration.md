@@ -381,11 +381,17 @@ array; `report.WriteJSONL` writes finding envelopes. Neither adds CLI scan metad
 
 ## Go SDK changes
 
-Update all imports to `/v2` and use Go 1.26 or newer (required by go-git v6):
+Update all imports to `/v2` and use Go 1.26 or newer. The Git source uses stable
+go-git v5; the module's Go version requirement remains unchanged:
 
 ```sh
 go get github.com/betterleaks/betterleaks/v2@v2.0.0-rc.1
 ```
+
+The Git source's public options are unchanged by the v5 port. If an integration
+compares Git errors against go-git v6 sentinels, update those imports to v5
+(for example, `plumbing.ErrReferenceNotFound` or `git.ErrRepositoryNotExists`).
+Sentinels from different major-version packages do not match with `errors.Is`.
 
 ### Replace Detector with Scanner and explicit sources
 

@@ -80,6 +80,9 @@ func (f *FS) ReadDir(name string) ([]os.FileInfo, error) {
 	info := make([]os.FileInfo, 0, len(entries))
 	for _, e := range entries {
 		i, err := e.Info()
+		if errors.Is(err, os.ErrNotExist) {
+			continue // Preserve the remaining entries during concurrent ref updates.
+		}
 		if err != nil {
 			return nil, err
 		}

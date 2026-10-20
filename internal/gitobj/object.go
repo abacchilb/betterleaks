@@ -165,7 +165,7 @@ func DecodeTag(_ ObjectReader, o EncodedObject) (*Tag, error) {
 	last := -1
 	for pos := 0; pos < len(message); {
 		line, _, _ := strings.Cut(message[pos:], "\n")
-		for _, marker := range []string{"-----BEGIN PGP SIGNATURE-----", "-----BEGIN PGP MESSAGE-----", "-----BEGIN CERTIFICATE-----", "-----BEGIN SIGNED MESSAGE-----", "-----BEGIN SSH SIGNATURE-----"} {
+		for _, marker := range []string{"-----BEGIN PGP SIGNATURE-----", "-----BEGIN PGP MESSAGE-----", "-----BEGIN SIGNED MESSAGE-----", "-----BEGIN SSH SIGNATURE-----"} {
 			if strings.HasPrefix(line, marker) {
 				last = pos
 				break

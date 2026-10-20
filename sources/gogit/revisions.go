@@ -108,8 +108,16 @@ func (r *repository) revisionBase(name string) (*gitobj.Commit, error) {
 	size := gitobj.FromObjectFormat(cfg.Extensions.ObjectFormat).Size()
 	if len(name) == size*2 && gitobj.IsHash(name) {
 		ids = append(ids, gitobj.NewHash(name))
-	} else if len(name) >= 4 && len(name) < size*2 {
-		if prefix, err := hex.DecodeString(name[:len(name)&^1]); err == nil {
+	} else if len(name) > 0 && len(name) < size*2 {
+		// Validate the dangling nibble too. Truncating it before decoding
+		// treats names like z or abz as possible object IDs, causing needless
+		// enumeration and surfacing unrelated object-directory errors.
+		hexName := name
+		if len(name)%2 != 0 {
+			hexName += "0"
+		}
+		if prefix, err := hex.DecodeString(hexName); err == nil {
+			prefix = prefix[:len(name)/2]
 			candidates, err := r.Storer.HashesWithPrefix(prefix)
 			if err != nil {
 				return nil, err
@@ -122,22 +130,27 @@ func (r *repository) revisionBase(name string) (*gitobj.Commit, error) {
 			}
 		}
 	}
-	for _, pattern := range []string{"%s", "refs/%s", "refs/tags/%s", "refs/heads/%s", "refs/remotes/%s", "refs/remotes/%s/HEAD"} {
-		ref, err := gitobj.ResolveReference(r.Storer, gitobj.ReferenceName(fmt.Sprintf(pattern, name)))
-		if err == nil {
-			ids = append(ids, ref.Hash())
-			break
-		}
-		if !errors.Is(err, gitobj.ErrReferenceNotFound) {
-			return nil, err
-		}
-	}
+	// Object IDs take precedence over equally named refs. Resolve them before
+	// reading refs so a broken same-named branch cannot invalidate a valid ID.
 	for _, id := range ids {
 		c, err := r.peelCommit(id)
 		if err == nil {
 			return c, nil
 		}
 		if !errors.Is(err, gitobj.ErrObjectNotFound) {
+			return nil, err
+		}
+	}
+	for _, pattern := range []string{"%s", "refs/%s", "refs/tags/%s", "refs/heads/%s", "refs/remotes/%s", "refs/remotes/%s/HEAD"} {
+		ref, err := gitobj.ResolveReference(r.Storer, gitobj.ReferenceName(fmt.Sprintf(pattern, name)))
+		if err == nil {
+			c, err := r.peelCommit(ref.Hash())
+			if errors.Is(err, gitobj.ErrObjectNotFound) {
+				return nil, gitobj.ErrReferenceNotFound
+			}
+			return c, err
+		}
+		if !errors.Is(err, gitobj.ErrReferenceNotFound) {
 			return nil, err
 		}
 	}

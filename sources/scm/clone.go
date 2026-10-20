@@ -20,7 +20,6 @@ import (
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/protocol/packp"
 	"github.com/go-git/go-git/v5/plumbing/protocol/packp/capability"
-	"github.com/go-git/go-git/v5/plumbing/protocol/packp/sideband"
 	"github.com/go-git/go-git/v5/plumbing/transport"
 	githttp "github.com/go-git/go-git/v5/plumbing/transport/http"
 	"github.com/go-git/go-git/v5/storage/filesystem"
@@ -40,7 +39,7 @@ type CloneOptions struct {
 func (o CloneOptions) Validate() error {
 	for _, ref := range o.Refs {
 		if !strings.HasPrefix(ref, "refs/") || strings.Count(ref, "*") > 1 ||
-			plumbing.ReferenceName(strings.ReplaceAll(ref, "*", "x")).Validate() != nil {
+			gitobj.ValidateReferenceName(plumbing.ReferenceName(strings.ReplaceAll(ref, "*", "x"))) != nil {
 			return fmt.Errorf("invalid clone ref %q: use a fully qualified refs/... name or pattern with at most one '*', without refspec remapping", ref)
 		}
 	}
@@ -189,7 +188,9 @@ func fetchRefs(ctx context.Context, remote, dest string, refs []config.RefSpec, 
 		request.Wants = append(request.Wants, id)
 	}
 	plumbing.HashesSort(request.Wants)
-	for _, cap := range []capability.Capability{capability.OFSDelta, capability.Sideband64k, capability.NoProgress} {
+	// With no progress consumer, request the raw pack stream, matching the v6
+	// source's protocol-v0 path. Protocol v2 uses different framing.
+	for _, cap := range []capability.Capability{capability.OFSDelta, capability.NoProgress} {
 		if advertised.Capabilities.Supports(cap) {
 			if err := request.Capabilities.Set(cap); err != nil {
 				return err
@@ -201,15 +202,11 @@ func fetchRefs(ctx context.Context, remote, dest string, refs []config.RefSpec, 
 		return err
 	}
 	defer response.Close()
-	var input io.Reader = response
-	if request.Capabilities.Supports(capability.Sideband64k) {
-		input = sideband.NewDemuxer(sideband.Sideband64k, response)
-	}
 	writer, err := storage.PackfileWriter()
 	if err != nil {
 		return err
 	}
-	_, copyErr := io.Copy(writer, input)
+	_, copyErr := io.Copy(writer, response)
 	if copyErr != nil {
 		writer.(*packWriter).err = copyErr
 	}

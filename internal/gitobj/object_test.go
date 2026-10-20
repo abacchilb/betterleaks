@@ -68,6 +68,21 @@ func TestTagDecoder(t *testing.T) {
 	}
 }
 
+func TestTagCertificateIsMessage(t *testing.T) {
+	for _, f := range []ObjectFormat{SHA1, SHA256} {
+		id := strings.Repeat("b", FromObjectFormat(f).Size()*2)
+		message := "release notes\n-----BEGIN CERTIFICATE-----\nTOKEN_AFTER_CERTIFICATE\n-----END CERTIFICATE-----\n"
+		raw := fmt.Sprintf("object %s\ntype commit\ntag release\n\n%s", id, message)
+		tag, err := DecodeTag(nil, encoded(t, f, TagObject, raw))
+		require.NoError(t, err)
+		require.Equal(t, message, tag.Message)
+		// A real signature following a certificate still ends the message.
+		tag, err = DecodeTag(nil, encoded(t, f, TagObject, raw+"-----BEGIN SIGNED MESSAGE-----\nsignature\n"))
+		require.NoError(t, err)
+		require.Equal(t, message, tag.Message)
+	}
+}
+
 func TestTreeModesAndWidths(t *testing.T) {
 	for _, f := range []ObjectFormat{SHA1, SHA256} {
 		id := NewHash(strings.Repeat("a", FromObjectFormat(f).Size()*2))

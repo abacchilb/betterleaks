@@ -3,6 +3,8 @@ package gitobj
 import (
 	"encoding/binary"
 	"path"
+	"slices"
+	"strings"
 
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
@@ -15,6 +17,15 @@ type DiffTreeOptions = object.DiffTreeOptions
 // synthetic IDs never leave the detector or identify stored Git objects. In
 // particular, SHA-256 IDs are never truncated into SHA-1 IDs.
 func DetectRenames(changes Changes, opts *DiffTreeOptions) (Changes, error) {
+	// Modified files are already paired. Sending them through the adapter
+	// duplicates their entries and hashes without contributing rename candidates,
+	// which is costly for large mixed commits. Preserve those entries verbatim.
+	candidates := 0
+	for _, c := range changes {
+		if c.From.Name == "" || c.To.Name == "" {
+			candidates++
+		}
+	}
 	store := &renameStore{Storage: memory.NewStorage(), entries: make(map[plumbing.Hash]ChangeEntry)}
 	ids := make(map[Hash]plumbing.Hash)
 	empty := &plumbing.MemoryObject{}
@@ -36,8 +47,13 @@ func DetectRenames(changes Changes, opts *DiffTreeOptions) (Changes, error) {
 		}
 		return object.ChangeEntry{Name: e.Name, Tree: tree, TreeEntry: object.TreeEntry{Name: "blob", Hash: id, Mode: e.TreeEntry.Mode}}
 	}
-	input := make(object.Changes, 0, len(changes))
+	input := make(object.Changes, 0, candidates)
+	out := make(Changes, 0, len(changes))
 	for _, c := range changes {
+		if c.From.Name != "" && c.To.Name != "" {
+			out = append(out, c)
+			continue
+		}
 		input = append(input, &object.Change{From: convert(c.From), To: convert(c.To)})
 	}
 	paired, err := object.DetectRenames(input, opts)
@@ -55,10 +71,22 @@ func DetectRenames(changes Changes, opts *DiffTreeOptions) (Changes, error) {
 		original.TreeEntry.Mode = e.TreeEntry.Mode
 		return original
 	}
-	out := make(Changes, 0, len(paired))
+	hasModified := len(out) != 0
 	for _, c := range paired {
 		out = append(out, &Change{From: restore(c.From), To: restore(c.To)})
 	}
+	if !hasModified {
+		return out, nil // v5 has already sorted the paired changes.
+	}
+	// Match v5's final path ordering after putting the original modifications
+	// back alongside its paired additions and deletions.
+	name := func(c *Change) string {
+		if c.From.Name != "" {
+			return c.From.Name
+		}
+		return c.To.Name
+	}
+	slices.SortStableFunc(out, func(a, b *Change) int { return strings.Compare(name(a), name(b)) })
 	return out, nil
 }
 

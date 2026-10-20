@@ -52,9 +52,29 @@ func (f repositoryFS) Open(n string) (billy.File, error) { return f.target(n).Op
 func (f repositoryFS) OpenFile(n string, flags int, mode os.FileMode) (billy.File, error) {
 	return f.target(n).OpenFile(n, flags, mode)
 }
-func (f repositoryFS) Stat(n string) (os.FileInfo, error)      { return f.target(n).Stat(n) }
-func (f repositoryFS) Lstat(n string) (os.FileInfo, error)     { return f.target(n).Lstat(n) }
-func (f repositoryFS) ReadDir(n string) ([]os.FileInfo, error) { return f.target(n).ReadDir(n) }
+func (f repositoryFS) Stat(n string) (os.FileInfo, error)  { return f.target(n).Stat(n) }
+func (f repositoryFS) Lstat(n string) (os.FileInfo, error) { return f.target(n).Lstat(n) }
+func (f repositoryFS) ReadDir(n string) ([]os.FileInfo, error) {
+	entries, err := f.target(n).ReadDir(n)
+	if err != nil || f.common == nil || filepath.Clean(n) != "refs" {
+		return entries, err
+	}
+	// Listing common refs alone cannot discover namespaces that exist only in
+	// the selected worktree. Replace the common private namespaces with this
+	// worktree's entries, just as target routes subsequent reads.
+	private := func(name string) bool { return name == "bisect" || name == "rewritten" || name == "worktree" }
+	entries = slices.DeleteFunc(entries, func(e os.FileInfo) bool { return private(e.Name()) })
+	local, err := f.Filesystem.ReadDir(n)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	for _, entry := range local {
+		if private(entry.Name()) {
+			entries = append(entries, entry)
+		}
+	}
+	return entries, nil
+}
 
 // An alternate names an object directory, whose basename need not be objects.
 // Expose only that directory through the scanner's logical objects/ namespace.
@@ -103,7 +123,8 @@ func (s *objectStorage) loadConfig() error {
 	if err := checkExtensions(c); err != nil {
 		return err
 	}
-	if strings.EqualFold(c.Raw.Section("extensions").Option("worktreeconfig"), "true") {
+	worktreeConfig, _ := parseConfigBool(c.Raw.Section("extensions").Option("worktreeconfig"))
+	if worktreeConfig {
 		worktree, err := readLimited(s.fs, "config.worktree", 16<<20)
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
@@ -120,7 +141,7 @@ func (s *objectStorage) loadConfig() error {
 			maps.Copy(c.Branches, overlay.Branches)
 		}
 	}
-	format := c.Raw.Section("extensions").Option("objectformat")
+	format := strings.ToLower(c.Raw.Section("extensions").Option("objectformat"))
 	switch format {
 	case "", "sha1":
 		c.Extensions.ObjectFormat = gitobj.SHA1
@@ -137,7 +158,11 @@ func (s *objectStorage) loadConfig() error {
 // extension could interpret its objects or references incorrectly.
 func checkExtensions(c *config.Config) error {
 	version := c.Raw.Section("core").Option("repositoryformatversion")
-	if version != "" && version != "0" && version != "1" {
+	if version == "" {
+		version = "0"
+	}
+	number, err := strconv.ParseUint(version, 10, 32)
+	if err != nil || number > 1 {
 		return fmt.Errorf("unsupported Git repository format version %q", version)
 	}
 	for _, option := range c.Raw.Section("extensions").Options {
@@ -146,11 +171,11 @@ func checkExtensions(c *config.Config) error {
 		case "noop":
 			continue
 		case "worktreeconfig":
-			if value == "true" || value == "false" {
+			if _, err := parseConfigBool(value); err == nil {
 				continue
 			}
 		case "noop-v1", "objectformat", "relativeworktrees":
-			if version != "1" {
+			if number != 1 {
 				return fmt.Errorf("core.repositoryformatversion does not support extension: %s", name)
 			}
 			if name == "noop-v1" || name == "objectformat" && (value == "" || value == "sha1" || value == "sha256") || name == "relativeworktrees" && (value == "true" || value == "false") {
@@ -287,8 +312,12 @@ func (s *objectStorage) loadRefs() error {
 	s.refsOnce.Do(func() { s.refsErr = s.readRefs() })
 	return s.refsErr
 }
-func (s *objectStorage) readRefs() error {
-	s.refs = make(map[gitobj.ReferenceName]*gitobj.Reference)
+func (s *objectStorage) loadPackedRefs() error {
+	s.packedOnce.Do(func() { s.packedErr = s.readPackedRefs() })
+	return s.packedErr
+}
+func (s *objectStorage) readPackedRefs() error {
+	s.packedRefs = make(map[gitobj.ReferenceName]*gitobj.Reference)
 	if f, err := s.fs.Open("packed-refs"); err == nil {
 		defer f.Close()
 		scanner := bufio.NewScanner(f)
@@ -309,7 +338,7 @@ func (s *objectStorage) readRefs() error {
 			if err != nil {
 				return err
 			}
-			s.refs[ref.Name()] = ref
+			s.packedRefs[ref.Name()] = ref
 		}
 		if err := scanner.Err(); err != nil {
 			return err
@@ -317,6 +346,13 @@ func (s *objectStorage) readRefs() error {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
+	return nil
+}
+func (s *objectStorage) readRefs() error {
+	if err := s.loadPackedRefs(); err != nil {
+		return err
+	}
+	s.refs = maps.Clone(s.packedRefs)
 	var walk func(string, int) error
 	walk = func(path string, depth int) error {
 		if err := s.ctx.Err(); err != nil {
@@ -341,6 +377,9 @@ func (s *objectStorage) readRefs() error {
 				continue
 			}
 			raw, err := readLimited(s.fs, name, 1<<20)
+			if errors.Is(err, os.ErrNotExist) {
+				continue // A ref can disappear between listing and opening it.
+			}
 			if err != nil {
 				return err
 			}
@@ -386,10 +425,31 @@ func (s *objectStorage) parseRef(name, value string) (*gitobj.Reference, error) 
 	return gitobj.NewHashReference(n, gitobj.NewHash(value)), nil
 }
 func (s *objectStorage) Reference(name gitobj.ReferenceName) (*gitobj.Reference, error) {
-	if err := s.loadRefs(); err != nil {
+	if err := s.ctx.Err(); err != nil {
 		return nil, err
 	}
-	r := s.refs[name]
+	if !name.IsSafe() {
+		return nil, gitobj.ErrReferenceNotFound
+	}
+	// Resolve only the requested ref. An unrelated broken ref or an in-flight
+	// lock file must not prevent an explicitly selected history scan. This also
+	// admits root pseudorefs such as ORIG_HEAD, which are not history roots.
+	info, err := s.fs.Stat(name.String())
+	if err == nil && !info.IsDir() {
+		raw, err := readLimited(s.fs, name.String(), 1<<20)
+		if err == nil && len(raw) > 0 {
+			return s.parseRef(name.String(), strings.TrimSpace(raw))
+		}
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	if err := s.loadPackedRefs(); err != nil {
+		return nil, err
+	}
+	r := s.packedRefs[name]
 	if r == nil {
 		return nil, gitobj.ErrReferenceNotFound
 	}
