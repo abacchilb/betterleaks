@@ -5,16 +5,16 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/betterleaks/betterleaks/v2/internal/gitobj"
 )
 
 // Header describes one packed record. Size is the inflated record size; for a
 // delta it measures the instruction stream, not the reconstructed object.
 type Header struct {
-	Type       plumbing.ObjectType
+	Type       gitobj.ObjectType
 	Size       int64
 	BaseOffset int64
-	BaseID     plumbing.Hash
+	BaseID     gitobj.Hash
 }
 
 // ReadHeader validates sizes and OFS distances before callers inflate or allocate.
@@ -31,7 +31,7 @@ func ReadHeader(r interface {
 	if err != nil {
 		return h, err
 	}
-	h.Type = plumbing.ObjectType((b >> 4) & 7)
+	h.Type = gitobj.ObjectType((b >> 4) & 7)
 	if !h.Type.Valid() {
 		return h, errors.New("invalid Git pack object type")
 	}
@@ -53,7 +53,7 @@ func ReadHeader(r interface {
 	}
 	h.Size = int64(size)
 	switch h.Type {
-	case plumbing.OFSDeltaObject:
+	case gitobj.OFSDeltaObject:
 		if b, err = r.ReadByte(); err != nil {
 			return h, err
 		}
@@ -71,7 +71,7 @@ func ReadHeader(r interface {
 			return h, errors.New("git delta offset out of bounds")
 		}
 		h.BaseOffset = offset - int64(distance)
-	case plumbing.REFDeltaObject:
+	case gitobj.REFDeltaObject:
 		h.BaseID.ResetBySize(hashSize)
 		_, err = h.BaseID.ReadFrom(r)
 	}

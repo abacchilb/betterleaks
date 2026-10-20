@@ -1,4 +1,4 @@
-// Package gogit scans committed additions using go-git's object reader.
+// Package gogit scans committed additions with a read-only Git object reader.
 // It never invokes Git, hooks, filters, or diff helpers. URL scans fetch an
 // HTTP(S) clone; local repository scans do not use a network transport.
 // Every bound on work per object, diff, and commit is defined in limits.go.
@@ -17,13 +17,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/betterleaks/betterleaks/v2/internal/gitobj"
 	"github.com/betterleaks/betterleaks/v2/internal/logging"
 	"github.com/betterleaks/betterleaks/v2/internal/urlredact"
 	"github.com/betterleaks/betterleaks/v2/sources"
 	"github.com/betterleaks/betterleaks/v2/sources/scm"
-	git "github.com/go-git/go-git/v6"
-	"github.com/go-git/go-git/v6/plumbing"
-	"github.com/go-git/go-git/v6/plumbing/object"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -71,7 +69,7 @@ type Source struct {
 	// os.TempDir and removed when the scan ends.
 	DiskCacheMiB int
 	// MaxBlobBytes defaults to 64 MiB. Larger blobs are skipped with a warning. It
-	// bounds diff inputs, not go-git's internal reads or the process's RSS.
+	// bounds diff inputs, not total working memory or the process's RSS.
 	MaxBlobBytes int64
 	// Include and Exclude accept history, merges, objects, unreachable-objects,
 	// commit-messages, notes, tag-messages, and reflogs. Reflogs scans each entry's
@@ -210,7 +208,7 @@ func (s *Source) Fragments(ctx context.Context, yield sources.FragmentsFunc) err
 			local.RepoPath, local.URL, local.Token = path, "", ""
 			local.CloneRefs, local.CloneAllRefs = nil, false
 			err := local.Fragments(ctx, yield)
-			if s.Revision != "" && !s.CloneAllRefs && errors.Is(err, plumbing.ErrReferenceNotFound) {
+			if s.Revision != "" && !s.CloneAllRefs && errors.Is(err, gitobj.ErrReferenceNotFound) {
 				return fmt.Errorf("%w; --revision selects fetched history; use --clone-ref=refs/... to fetch additional refs", err)
 			}
 			return err
@@ -262,7 +260,7 @@ func (s *Source) Fragments(ctx context.Context, yield sources.FragmentsFunc) err
 	return ctx.Err()
 }
 
-func (s *Source) commits(ctx context.Context, r *git.Repository, walk *history, sel selection, yield sources.FragmentsFunc) error {
+func (s *Source) commits(ctx context.Context, r *repository, walk *history, sel selection, yield sources.FragmentsFunc) error {
 	accept := s.selector()
 	workers := s.Workers
 	if workers == 0 {
@@ -272,10 +270,10 @@ func (s *Source) commits(ctx context.Context, r *git.Repository, walk *history, 
 	if maxBlob == 0 {
 		maxBlob = defaultMaxBlobBytes
 	}
-	shared := worker{source: s, trees: &treeCache{r: r}, store: walk.store, maxBlob: maxBlob, patches: &patchCache{}, scope: sel.scope(), merges: sel.merges, differ: lineDiffer{}}
+	shared := worker{source: s, trees: &treeCache{r: r}, store: walk.store, maxBlob: maxBlob, patches: &patchCache{}, scope: sel.scope(), merges: sel.merges, differ: lineDiffer{}} //nolint:exhaustruct // Scan-local caches start empty.
 	// The producer owns traversal; at most one queued commit per worker.
 	group, workCtx := errgroup.WithContext(ctx)
-	jobs := make(chan *object.Commit, workers)
+	jobs := make(chan *gitobj.Commit, workers)
 	for range workers {
 		group.Go(func() error {
 			w := shared
@@ -324,17 +322,17 @@ func (s *Source) commits(ctx context.Context, r *git.Repository, walk *history, 
 	return err
 }
 
-func (s *Source) selector() func(*object.Commit) bool {
+func (s *Source) selector() func(*gitobj.Commit) bool {
 	author, _ := regexp.Compile(s.Author)
 	committer, _ := regexp.Compile(s.Committer)
-	return func(c *object.Commit) bool {
+	return func(c *gitobj.Commit) bool {
 		return !(s.Since != nil && c.Committer.When.Before(*s.Since)) && !(s.Until != nil && c.Committer.When.After(*s.Until)) &&
 			(s.Author == "" || author.MatchString(c.Author.Name+" <"+c.Author.Email+">")) &&
 			(s.Committer == "" || committer.MatchString(c.Committer.Name+" <"+c.Committer.Email+">"))
 	}
 }
 
-func commitAttributes(c *object.Commit) map[string]string {
+func commitAttributes(c *gitobj.Commit) map[string]string {
 	return map[string]string{
 		sources.AttrGitSHA: c.Hash.String(), sources.AttrGitAuthorName: c.Author.Name, sources.AttrGitAuthorEmail: c.Author.Email,
 		sources.AttrGitDate: c.Author.When.UTC().Format(time.RFC3339), sources.AttrGitMessage: c.Message,
@@ -361,7 +359,7 @@ func (s *Source) skip(err error, format string, args ...any) {
 	logging.OrDiscard(s.Logger).Warn("skipped Git content over a limit", "content", fmt.Sprintf(format, args...), "error", err)
 }
 
-func (w *worker) commit(ctx context.Context, c *object.Commit, yield sources.FragmentsFunc) error {
+func (w *worker) commit(ctx context.Context, c *gitobj.Commit, yield sources.FragmentsFunc) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -386,7 +384,7 @@ func (w *worker) commit(ctx context.Context, c *object.Commit, yield sources.Fra
 	if w.scope&scanPatches == 0 || (len(parents) > 1 && !w.merges) {
 		return nil
 	}
-	var parent plumbing.Hash
+	var parent gitobj.Hash
 	if len(parents) > 0 {
 		parent = parents[0]
 	}

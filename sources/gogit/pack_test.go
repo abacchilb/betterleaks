@@ -14,10 +14,9 @@ import (
 	"strings"
 	"testing"
 
-	format "github.com/go-git/go-git/v6/plumbing/format/config"
-
-	"github.com/go-git/go-git/v6/plumbing"
-	"github.com/go-git/go-git/v6/plumbing/format/packfile"
+	"github.com/betterleaks/betterleaks/v2/internal/gitobj"
+	format "github.com/go-git/go-git/v5/plumbing/format/config"
+	"github.com/go-git/go-git/v5/plumbing/format/packfile"
 	"github.com/stretchr/testify/require"
 )
 
@@ -59,7 +58,7 @@ func TestPackedObjectBounds(t *testing.T) {
 				return
 			}
 			require.NoError(t, err)
-			require.Equal(t, plumbing.BlobObject, e.kind)
+			require.Equal(t, gitobj.BlobObject, e.kind)
 			require.Equal(t, "abc", e.raw)
 			ctx, cancel := context.WithCancel(t.Context())
 			cancel()
@@ -133,16 +132,16 @@ func TestPackedObjects(t *testing.T) {
 					require.NoError(t, err)
 					if entry.kind.IsDelta() {
 						deltas++
-						want := plumbing.REFDeltaObject
+						want := gitobj.REFDeltaObject
 						if offsets {
-							want = plumbing.OFSDeltaObject
+							want = gitobj.OFSDeltaObject
 						}
 						require.Equal(t, want, entry.kind)
 					}
 					store.objects.Clear() // Exercise reconstruction, not an earlier cache hit.
 					o, err := store.read(e.Hash)
 					require.NoError(t, err)
-					h := plumbing.NewHasher(objectFormat, o.Type(), o.Size())
+					h := gitobj.NewHasher(objectFormat, o.Type(), o.Size())
 					h.Write([]byte(o.raw))
 					require.Equal(t, e.Hash, h.Sum())
 					count++
@@ -159,7 +158,7 @@ func TestPackWithoutReverseIndex(t *testing.T) {
 	gitFixture(t, repo, "-c", "pack.writeReverseIndex=false", "repack", "-ad")
 	r, cleanup, err := (&Source{RepoPath: repo}).open(t.Context())
 	require.NoError(t, err)
-	require.Empty(t, r.Storer.(*objectStorage).packs)
+	require.Len(t, r.Storer.(*objectStorage).packs, 1, "packs without .rev use a compact reverse permutation")
 	cleanup()
 	t.Setenv("PATH", t.TempDir())
 	fs := collect(t, &Source{RepoPath: repo})

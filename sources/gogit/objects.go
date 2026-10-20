@@ -3,54 +3,53 @@ package gogit
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"strings"
 	"sync"
 
-	"github.com/go-git/go-git/v6/plumbing"
-	"github.com/go-git/go-git/v6/plumbing/object"
-	"github.com/go-git/go-git/v6/storage/filesystem"
+	"github.com/betterleaks/betterleaks/v2/internal/gitobj"
+	"github.com/go-git/go-git/v5/config"
 )
 
-// objectStorage keeps go-git's repository discovery, indexes and loose-object
-// support, but materializes deltas directly into immutable strings. The normal
-// reader copies the base, builds a temporary result, copies it into MemoryObject,
-// then hashes that result before the source copies it into a string again.
-//
-// go-git's storage interfaces take no context, so the scan's context is held
-// here and checked on every read.
+// objectStorage reads immutable repository objects through the scanner's
+// bounded caches and lazy indexes. It owns no writable Git storage and checks
+// the scan context before reads and during decompression.
 type objectStorage struct {
-	*filesystem.Storage
-	objects *objectCache
-	ctx     context.Context
-	limit   int64
-	packs   []*objectPack
-	disk    *diskObjectCache
-	shallow map[plumbing.Hash]struct{}
+	fs         readOnlyFS
+	cfg        *config.Config
+	alternates []readOnlyFS
+	refsOnce   sync.Once
+	refs       map[gitobj.ReferenceName]*gitobj.Reference
+	refsErr    error
+	objects    *objectCache
+	ctx        context.Context
+	limit      int64
+	packs      []*objectPack
+	disk       *diskObjectCache
+	shallow    map[gitobj.Hash]struct{}
 }
 
-func (s *objectStorage) EncodedObject(kind plumbing.ObjectType, id plumbing.Hash) (plumbing.EncodedObject, error) {
+func (s *objectStorage) EncodedObject(kind gitobj.ObjectType, id gitobj.Hash) (gitobj.EncodedObject, error) {
 	o, err := s.read(id)
 	if err != nil {
 		return nil, err
 	}
-	if kind != plumbing.AnyObject && o.Type() != kind {
-		return nil, plumbing.ErrObjectNotFound
+	if kind != gitobj.AnyObject && o.Type() != kind {
+		return nil, gitobj.ErrObjectNotFound
 	}
 	return o, nil
 }
 
 // parents returns a commit's parents. Like Git, shallow boundary commits are
 // treated as root commits because their parents were never fetched.
-func (s *objectStorage) parents(c *object.Commit) []plumbing.Hash {
+func (s *objectStorage) parents(c *gitobj.Commit) []gitobj.Hash {
 	if _, ok := s.shallow[c.Hash]; ok {
 		return nil
 	}
 	return c.ParentHashes
 }
 
-func (s *objectStorage) read(id plumbing.Hash) (*storedObject, error) {
+func (s *objectStorage) read(id gitobj.Hash) (*storedObject, error) {
 	if err := s.ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -67,7 +66,7 @@ func (s *objectStorage) read(id plumbing.Hash) (*storedObject, error) {
 	return s.readFallback(id)
 }
 
-func (s *objectStorage) cached(id plumbing.Hash) *storedObject {
+func (s *objectStorage) cached(id gitobj.Hash) *storedObject {
 	if o, ok := s.objects.Get(id); ok {
 		if o, ok := o.(*storedObject); ok {
 			return o
@@ -82,11 +81,11 @@ func (s *objectStorage) keep(o *storedObject) {
 }
 
 // locate finds id in the mapped packs. A nil pack means the object is loose,
-// in an alternate, or in a pack without a reverse index.
-func (s *objectStorage) locate(id plumbing.Hash) (*objectPack, int64, error) {
+// in an alternate, or absent.
+func (s *objectStorage) locate(id gitobj.Hash) (*objectPack, int64, error) {
 	for _, p := range s.packs {
 		offset, err := p.index.FindOffset(id)
-		if errors.Is(err, plumbing.ErrObjectNotFound) {
+		if errors.Is(err, gitobj.ErrObjectNotFound) {
 			continue
 		}
 		return p, offset, err
@@ -94,29 +93,17 @@ func (s *objectStorage) locate(id plumbing.Hash) (*objectPack, int64, error) {
 	return nil, 0, nil
 }
 
-// readFallback uses upstream's reader for loose objects, alternates and packs
-// without a reverse index. DeltaObject probes loose files even for every packed
-// delta base, which is substantially slower than the mapped pack path.
-func (s *objectStorage) readFallback(id plumbing.Hash) (*storedObject, error) {
+// readFallback reads loose objects after the pack indexes have been searched.
+func (s *objectStorage) readFallback(id gitobj.Hash) (*storedObject, error) {
 	if o := s.cached(id); o != nil {
 		return o, nil
 	}
-	o, err := s.Storage.EncodedObject(plumbing.AnyObject, id)
-	if err != nil {
-		return nil, err
-	}
-	raw, err := readObjectString(s.ctx, o, s.limit)
-	if err != nil {
-		return nil, fmt.Errorf("object %s: %w", id, err)
-	}
-	result := &storedObject{id: id, kind: o.Type(), raw: raw}
-	s.objects.Put(result)
-	return result, nil
+	return s.readLoose(id)
 }
 
 var objectReadBuffers = sync.Pool{New: func() any { return new([32 << 10]byte) }}
 
-func readObjectString(ctx context.Context, obj plumbing.EncodedObject, limit int64) (string, error) {
+func readObjectString(ctx context.Context, obj gitobj.EncodedObject, limit int64) (string, error) {
 	if obj.Size() < 0 {
 		return "", errors.New("negative git object size")
 	}
@@ -143,16 +130,16 @@ func readObjectString(ctx context.Context, obj plumbing.EncodedObject, limit int
 }
 
 type storedObject struct {
-	id   plumbing.Hash
-	kind plumbing.ObjectType
+	id   gitobj.Hash
+	kind gitobj.ObjectType
 	raw  string
 }
 
-func (o *storedObject) Hash() plumbing.Hash       { return o.id }
-func (o *storedObject) Type() plumbing.ObjectType { return o.kind }
-func (o *storedObject) Size() int64               { return int64(len(o.raw)) }
-func (*storedObject) SetType(plumbing.ObjectType) {}
-func (*storedObject) SetSize(int64)               {}
+func (o *storedObject) Hash() gitobj.Hash       { return o.id }
+func (o *storedObject) Type() gitobj.ObjectType { return o.kind }
+func (o *storedObject) Size() int64             { return int64(len(o.raw)) }
+func (*storedObject) SetType(gitobj.ObjectType) {}
+func (*storedObject) SetSize(int64)             {}
 func (o *storedObject) Reader() (io.ReadCloser, error) {
 	return objectStringReader{strings.NewReader(o.raw)}, nil
 }
@@ -176,3 +163,5 @@ func (r contextReader) Read(b []byte) (int, error) {
 	}
 	return r.r.Read(b)
 }
+
+func (o *storedObject) Text() string { return o.raw }

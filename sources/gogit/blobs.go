@@ -7,18 +7,15 @@ import (
 	"io"
 	"slices"
 
+	"github.com/betterleaks/betterleaks/v2/internal/gitobj"
 	"github.com/betterleaks/betterleaks/v2/sources"
-	git "github.com/go-git/go-git/v6"
-	"github.com/go-git/go-git/v6/plumbing"
-	"github.com/go-git/go-git/v6/plumbing/filemode"
-	"github.com/go-git/go-git/v6/plumbing/object"
-	"github.com/go-git/go-git/v6/plumbing/storer"
+	"github.com/go-git/go-git/v5/plumbing/filemode"
 )
 
 // Enumerate by hash prefix so an all-object scan does not retain an inventory
 // of the entire repository. The storage reader includes packs and alternates
 // and deduplicates IDs present in multiple locations.
-func objectIDs(ctx context.Context, store *objectStorage, yield func(plumbing.Hash) error) error {
+func objectIDs(ctx context.Context, store *objectStorage, yield func(gitobj.Hash) error) error {
 	for prefix := 0; prefix < 256; prefix++ {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -27,7 +24,7 @@ func objectIDs(ctx context.Context, store *objectStorage, yield func(plumbing.Ha
 		if err != nil {
 			return err
 		}
-		plumbing.HashesSort(ids)
+		gitobj.HashesSort(ids)
 		for _, id := range ids {
 			if err := ctx.Err(); err != nil {
 				return err
@@ -40,14 +37,14 @@ func objectIDs(ctx context.Context, store *objectStorage, yield func(plumbing.Ha
 	return ctx.Err()
 }
 
-func (s *Source) blobs(ctx context.Context, r *git.Repository, unreachable bool, yield sources.FragmentsFunc) error {
+func (s *Source) blobs(ctx context.Context, r *repository, unreachable bool, yield sources.FragmentsFunc) error {
 	store := r.Storer.(*objectStorage)
-	emit := func(id plumbing.Hash) error {
+	emit := func(id gitobj.Hash) error {
 		attrs := map[string]string{sources.AttrResource: sources.ResourceGitBlob, sources.AttrGitBlobSHA: id.String()}
 		if s.Prefilter != nil && s.Prefilter(attrs) {
 			return nil
 		}
-		obj, err := store.EncodedObject(plumbing.AnyObject, id)
+		obj, err := store.EncodedObject(gitobj.AnyObject, id)
 		if isLimit(err) {
 			s.skip(err, "object %s", id)
 			return nil
@@ -55,7 +52,7 @@ func (s *Source) blobs(ctx context.Context, r *git.Repository, unreachable bool,
 		if err != nil {
 			return fmt.Errorf("object %s: %w", id, err)
 		}
-		if obj.Type() != plumbing.BlobObject {
+		if obj.Type() != gitobj.BlobObject {
 			return nil
 		}
 		reader, err := obj.Reader()
@@ -74,8 +71,8 @@ func (s *Source) blobs(ctx context.Context, r *git.Repository, unreachable bool,
 	// This optional pass retains compact IDs and one traversal byte per object,
 	// not decoded objects or a commit-to-path reverse index. Fail explicitly at
 	// the bound instead of producing a partial classification without warning.
-	var ids []plumbing.Hash
-	if err := objectIDs(ctx, store, func(id plumbing.Hash) error {
+	var ids []gitobj.Hash
+	if err := objectIDs(ctx, store, func(id gitobj.Hash) error {
 		if len(ids) == maxUnreachableObjects {
 			return fmt.Errorf("unreachable-object inventory exceeds %d objects; use objects to scan all blobs without reachability classification", maxUnreachableObjects)
 		}
@@ -105,16 +102,16 @@ func (s *Source) blobs(ctx context.Context, r *git.Repository, unreachable bool,
 // directly to trees or blobs. Reflogs, the index, and scan selection are not roots.
 // Blob edges are marked without decompressing their contents. Gitlinks refer to
 // a different repository and must not be followed.
-func reachableObjects(ctx context.Context, r *git.Repository, ids []plumbing.Hash) ([]byte, error) {
+func reachableObjects(ctx context.Context, r *repository, ids []gitobj.Hash) ([]byte, error) {
 	store := r.Storer.(*objectStorage)
 	reached := make([]byte, len(ids))
 	type edge struct {
-		id   plumbing.Hash
-		kind plumbing.ObjectType
+		id   gitobj.Hash
+		kind gitobj.ObjectType
 	}
 	var pending []edge
-	add := func(id plumbing.Hash, kind plumbing.ObjectType) error {
-		i, found := slices.BinarySearchFunc(ids, id, func(a, b plumbing.Hash) int { return a.Compare(b.Bytes()) })
+	add := func(id gitobj.Hash, kind gitobj.ObjectType) error {
+		i, found := slices.BinarySearchFunc(ids, id, func(a, b gitobj.Hash) int { return a.Compare(b.Bytes()) })
 		if !found {
 			return fmt.Errorf("reachable object %s is missing from object inventory", id)
 		}
@@ -122,7 +119,7 @@ func reachableObjects(ctx context.Context, r *git.Repository, ids []plumbing.Has
 			return nil
 		}
 		reached[i] = 1
-		if kind != plumbing.BlobObject {
+		if kind != gitobj.BlobObject {
 			pending = append(pending, edge{id, kind})
 		}
 		return nil
@@ -134,10 +131,10 @@ func reachableObjects(ctx context.Context, r *git.Repository, ids []plumbing.Has
 	defer refs.Close()
 	head, err := r.Head()
 	if err == nil {
-		if err := add(head.Hash(), plumbing.AnyObject); err != nil {
+		if err := add(head.Hash(), gitobj.AnyObject); err != nil {
 			return nil, err
 		}
-	} else if !errors.Is(err, plumbing.ErrReferenceNotFound) {
+	} else if !errors.Is(err, gitobj.ErrReferenceNotFound) {
 		return nil, err
 	}
 	for {
@@ -151,17 +148,17 @@ func reachableObjects(ctx context.Context, r *git.Repository, ids []plumbing.Has
 		if err != nil {
 			return nil, err
 		}
-		if ref.Type() == plumbing.SymbolicReference {
+		if ref.Type() == gitobj.SymbolicReference {
 			name := ref.Name()
-			ref, err = storer.ResolveReference(r.Storer, name)
+			ref, err = gitobj.ResolveReference(r.Storer, name)
 			if err != nil {
-				if name == plumbing.HEAD && errors.Is(err, plumbing.ErrReferenceNotFound) {
+				if name == gitobj.HEAD && errors.Is(err, gitobj.ErrReferenceNotFound) {
 					continue // An unborn repository can still contain stored blobs.
 				}
 				return nil, err
 			}
 		}
-		if err := add(ref.Hash(), plumbing.AnyObject); err != nil {
+		if err := add(ref.Hash(), gitobj.AnyObject); err != nil {
 			return nil, err
 		}
 	}
@@ -176,16 +173,16 @@ func reachableObjects(ctx context.Context, r *git.Repository, ids []plumbing.Has
 			return nil, err
 		}
 		switch obj := obj.(type) {
-		case *object.Commit:
+		case *gitobj.Commit:
 			for _, parent := range store.parents(obj) {
-				if err := add(parent, plumbing.CommitObject); err != nil {
+				if err := add(parent, gitobj.CommitObject); err != nil {
 					return nil, err
 				}
 			}
-			if err := add(obj.TreeHash, plumbing.TreeObject); err != nil {
+			if err := add(obj.TreeHash, gitobj.TreeObject); err != nil {
 				return nil, err
 			}
-		case *object.Tree:
+		case *gitobj.Tree:
 			for _, entry := range obj.Entries {
 				if err := ctx.Err(); err != nil {
 					return nil, err
@@ -193,19 +190,19 @@ func reachableObjects(ctx context.Context, r *git.Repository, ids []plumbing.Has
 				if entry.Mode == filemode.Submodule {
 					continue
 				}
-				kind := plumbing.BlobObject
+				kind := gitobj.BlobObject
 				if entry.Mode == filemode.Dir {
-					kind = plumbing.TreeObject
+					kind = gitobj.TreeObject
 				}
 				if err := add(entry.Hash, kind); err != nil {
 					return nil, err
 				}
 			}
-		case *object.Tag:
+		case *gitobj.Tag:
 			if err := add(obj.Target, obj.TargetType); err != nil {
 				return nil, err
 			}
-		case *object.Blob:
+		case *gitobj.Blob:
 			// A ref can point directly to a blob.
 		default:
 			return nil, fmt.Errorf("unsupported reachable object %s", e.id)

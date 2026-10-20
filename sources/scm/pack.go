@@ -22,12 +22,11 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/betterleaks/betterleaks/v2/internal/gitfs"
+	"github.com/betterleaks/betterleaks/v2/internal/gitobj"
 	"github.com/betterleaks/betterleaks/v2/internal/gitpack"
-	"github.com/go-git/go-billy/v6/osfs"
-	"github.com/go-git/go-git/v6/plumbing"
-	format "github.com/go-git/go-git/v6/plumbing/format/config"
-	githash "github.com/go-git/go-git/v6/plumbing/hash"
-	"github.com/go-git/go-git/v6/storage/filesystem"
+	format "github.com/go-git/go-git/v5/plumbing/format/config"
+	"github.com/go-git/go-git/v5/storage/filesystem"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -212,7 +211,7 @@ func (w *packWriter) Close() (err error) {
 	}
 	// Resolving reads delta records all over the pack. A read-only mapping
 	// avoids a system call per record where the platform supports it.
-	pack, err := osfs.New(w.dir, osfs.WithMmap()).Open("pack")
+	pack, err := gitfs.New(w.dir, gitfs.WithMmap()).Open("pack")
 	if err == nil {
 		err = indexTable(w.s.ctx, pack, w.table, w.s.limits, out, rev)
 		err = errors.Join(err, pack.Close())
@@ -226,7 +225,7 @@ func (w *packWriter) Close() (err error) {
 	}
 	base := filepath.Join(w.s.dir, "pack-"+w.table.checksum.String())
 	// Exclusive links publish complete files without replacing an existing pack.
-	// Refs are updated by go-git only after Close succeeds. Roll back installed files
+	// The fetcher updates refs only after Close succeeds. Roll back installed files
 	// on publication/reindex failure; temporary files are always removed above.
 	var installed []string
 	defer func() {
@@ -245,9 +244,7 @@ func (w *packWriter) Close() (err error) {
 	if err := w.s.ctx.Err(); err != nil {
 		return err
 	}
-	if err := w.s.Reindex(); err != nil {
-		return err
-	}
+	w.s.Reindex()
 	return w.s.ctx.Err()
 }
 
@@ -259,8 +256,8 @@ type packRecord struct {
 	offset, size int64
 	crc          uint32
 	child, next  uint32
-	header       uint8               // Bytes from offset to the compressed content.
-	kind, typ    plumbing.ObjectType // Original record kind, resolved type.
+	header       uint8             // Bytes from offset to the compressed content.
+	kind, typ    gitobj.ObjectType // Original record kind, resolved type.
 }
 
 func (o *packRecord) content() int64 { return o.offset + int64(o.header) }
@@ -273,7 +270,7 @@ type packTable struct {
 	ids         []byte // Each record's ID, idSize bytes apiece; zero until resolved.
 	idSize      int
 	refChildren map[[32]byte]uint32
-	checksum    plumbing.Hash
+	checksum    gitobj.Hash
 	end         int64 // Where the trailing checksum starts.
 }
 
@@ -393,13 +390,13 @@ func (z *packInflater) copy(ctx context.Context, dst io.Writer, src io.Reader, s
 
 // indexPack indexes a complete pack: the fetch runs the same passes, the first
 // one while the pack downloads.
-func indexPack(ctx context.Context, f io.ReaderAt, size int64, objectFormat format.ObjectFormat, limits packLimits, out, reverse io.Writer) (plumbing.Hash, error) {
+func indexPack(ctx context.Context, f io.ReaderAt, size int64, objectFormat format.ObjectFormat, limits packLimits, out, reverse io.Writer) (gitobj.Hash, error) {
 	t, err := scanPack(ctx, io.NewSectionReader(f, 0, size), objectFormat, limits)
 	if err == nil {
 		err = indexTable(ctx, f, t, limits, out, reverse)
 	}
 	if err != nil {
-		return plumbing.Hash{}, err
+		return gitobj.Hash{}, err
 	}
 	return t.checksum, nil
 }
@@ -411,10 +408,10 @@ func scanPack(ctx context.Context, src io.Reader, objectFormat format.ObjectForm
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if objectFormat == format.UnsetObjectFormat {
+	if objectFormat == gitobj.UnsetObjectFormat {
 		objectFormat = format.SHA1
 	}
-	h, err := githash.FromObjectFormat(objectFormat)
+	h, err := gitobj.NewChecksum(objectFormat)
 	if err != nil {
 		return nil, err
 	}
@@ -444,9 +441,9 @@ func scanPack(ctx context.Context, src io.Reader, objectFormat format.ObjectForm
 			return nil, fmt.Errorf("delta at offset %d exceeds %d instruction bytes", o.offset, limits.objectBytes)
 		}
 		dst := io.Discard
-		var objectHash plumbing.Hasher
+		var objectHash gitobj.Hasher
 		if !o.kind.IsDelta() {
-			objectHash = plumbing.NewHasher(objectFormat, o.kind, o.size)
+			objectHash = gitobj.NewHasher(objectFormat, o.kind, o.size)
 			dst = &objectHash
 		}
 		if err := inflater.copy(ctx, dst, r, o.size); err != nil {
@@ -461,13 +458,13 @@ func scanPack(ctx context.Context, src io.Reader, objectFormat format.ObjectForm
 		o.crc = r.crc.Sum32()
 		link := uint32(len(t.objects) + 1)
 		switch o.kind {
-		case plumbing.OFSDeltaObject:
+		case gitobj.OFSDeltaObject:
 			parent := sort.Search(len(t.objects), func(i int) bool { return t.objects[i].offset >= header.BaseOffset })
 			if parent == len(t.objects) || t.objects[parent].offset != header.BaseOffset {
 				return nil, errors.New("OFS delta base is not a pack record")
 			}
 			o.next, t.objects[parent].child = t.objects[parent].child, link
-		case plumbing.REFDeltaObject:
+		case gitobj.REFDeltaObject:
 			key := idKey(header.BaseID.Bytes())
 			o.next, t.refChildren[key] = t.refChildren[key], link
 		}
@@ -561,7 +558,7 @@ func writeIndex(ctx context.Context, t *packTable, out, reverse io.Writer) error
 	rev := newChecksumWriter(ctx, reverse, t.format)
 	rev.write([]byte("RIDX"))
 	rev.uint32(1)
-	if t.idSize == format.SHA256Size {
+	if t.idSize == gitobj.SHA256Size {
 		rev.uint32(2)
 	} else {
 		rev.uint32(1)
@@ -584,7 +581,7 @@ type checksumWriter struct {
 }
 
 func newChecksumWriter(ctx context.Context, out io.Writer, objectFormat format.ObjectFormat) *checksumWriter {
-	h, err := githash.FromObjectFormat(objectFormat)
+	h, err := gitobj.NewChecksum(objectFormat)
 	c := &checksumWriter{out: packContextWriter{ctx, out}, h: h, err: err}
 	if err == nil {
 		c.w = bufio.NewWriterSize(io.MultiWriter(c.out, h), 64<<10)
@@ -813,7 +810,7 @@ func (r *resolver) visit(level int) error {
 			return err
 		}
 		objects[child].typ = objects[i].typ
-		h := plumbing.NewHasher(r.t.format, objects[child].typ, int64(len(target)))
+		h := gitobj.NewHasher(r.t.format, objects[child].typ, int64(len(target)))
 		if _, err := io.CopyBuffer(&h, packContextReader{r.ctx, strings.NewReader(target)}, r.inflater.buf[:]); err != nil {
 			return err
 		}

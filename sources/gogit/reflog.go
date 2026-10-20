@@ -13,8 +13,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/betterleaks/betterleaks/v2/internal/gitobj"
 	"github.com/betterleaks/betterleaks/v2/sources"
-	"github.com/go-git/go-git/v6/plumbing"
 )
 
 // Reflogs are local journals, not Git objects. Stream them without keeping a
@@ -27,7 +27,7 @@ func (s *Source) reflogs(ctx context.Context, store *objectStorage, roots *histo
 	if err != nil {
 		return err
 	}
-	hashLength := plumbing.FromObjectFormat(cfg.Extensions.ObjectFormat).Size() * 2
+	hashLength := gitobj.FromObjectFormat(cfg.Extensions.ObjectFormat).Size() * 2
 	fs := store.Filesystem().(readOnlyFS)
 	root, err := os.OpenRoot(fs.objectRoot)
 	if err != nil {
@@ -76,7 +76,7 @@ func (s *Source) reflogs(ctx context.Context, store *objectStorage, roots *histo
 				}
 			}
 			if roots != nil {
-				for _, id := range []plumbing.Hash{e.old, e.new} {
+				for _, id := range []gitobj.Hash{e.old, e.new} {
 					if id.IsZero() {
 						continue
 					}
@@ -197,7 +197,7 @@ func walkReflogs(ctx context.Context, root *os.Root, name, ref string, depth int
 }
 
 type reflogEntry struct {
-	old, new             plumbing.Hash
+	old, new             gitobj.Hash
 	name, email, message string
 	when                 time.Time
 }
@@ -212,7 +212,7 @@ func parseReflog(line string, hashLength int) (reflogEntry, error) {
 		return e, bad
 	}
 	for _, id := range fields[:2] {
-		if len(id) != hashLength || !plumbing.IsHash(id) {
+		if len(id) != hashLength || !gitobj.IsHash(id) {
 			return e, bad
 		}
 	}
@@ -232,7 +232,7 @@ func parseReflog(line string, hashLength int) (reflogEntry, error) {
 	if err != nil {
 		return e, bad
 	}
-	e.old, e.new = plumbing.NewHash(fields[0]), plumbing.NewHash(fields[1])
+	e.old, e.new = gitobj.NewHash(fields[0]), gitobj.NewHash(fields[1])
 	e.name, e.email, e.message = fields[2][:emailStart], fields[2][emailStart+2:emailEnd], message
 	e.when = time.Unix(seconds, 0).UTC()
 	if e.when.Year() < 0 || e.when.Year() > 9999 {

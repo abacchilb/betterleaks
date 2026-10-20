@@ -15,10 +15,10 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/betterleaks/betterleaks/v2/internal/gitfs"
+	"github.com/betterleaks/betterleaks/v2/internal/gitobj"
 	"github.com/betterleaks/betterleaks/v2/sources"
-	"github.com/go-git/go-billy/v6/osfs"
-	"github.com/go-git/go-git/v6/plumbing"
-	format "github.com/go-git/go-git/v6/plumbing/format/config"
+	format "github.com/go-git/go-git/v5/plumbing/format/config"
 	"github.com/stretchr/testify/require"
 )
 
@@ -104,9 +104,9 @@ func TestDeepDeltaChain(t *testing.T) {
 	require.NoError(t, err)
 	defer cleanup()
 	store := r.Storer.(*objectStorage)
-	o, err := store.read(plumbing.NewHash(deepest))
+	o, err := store.read(gitobj.NewHash(deepest))
 	require.NoError(t, err)
-	h := plumbing.NewHasher(format.SHA1, o.Type(), o.Size())
+	h := gitobj.NewHasher(format.SHA1, o.Type(), o.Size())
 	h.Write([]byte(o.raw))
 	require.Equal(t, deepest, h.Sum().String())
 	found := false
@@ -362,7 +362,7 @@ func TestUnsafeStorageFiles(t *testing.T) {
 			t.Skip("mkfifo fixture generator unavailable")
 		}
 		root := t.TempDir()
-		fs := readOnlyFS{Filesystem: osfs.New(root), objectRoot: root}
+		fs := readOnlyFS{Filesystem: gitfs.New(root), objectRoot: root}
 		for _, path := range []string{"shallow", "commondir", "objects/info/alternates", "objects/ab/cd", "objects/pack/pack-test.pack"} {
 			full := filepath.Join(root, path)
 			require.NoError(t, os.MkdirAll(filepath.Dir(full), 0700))
@@ -386,7 +386,7 @@ func TestUnsafeStorageFiles(t *testing.T) {
 
 func TestShallowLimits(t *testing.T) {
 	root := t.TempDir()
-	fs := readOnlyFS{Filesystem: osfs.New(root), objectRoot: root}
+	fs := readOnlyFS{Filesystem: gitfs.New(root), objectRoot: root}
 	path := filepath.Join(root, "shallow")
 	require.NoError(t, os.WriteFile(path, []byte(strings.Repeat("1", 40)+"\n"), 0600))
 	ids, err := readShallow(fs)

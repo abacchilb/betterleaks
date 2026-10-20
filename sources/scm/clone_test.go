@@ -15,8 +15,9 @@ import (
 	"sync/atomic"
 	"testing"
 
-	git "github.com/go-git/go-git/v6"
-	"github.com/go-git/go-git/v6/plumbing"
+	git "github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/storage/filesystem"
 	"github.com/stretchr/testify/require"
 )
 
@@ -234,7 +235,7 @@ func TestCloneFromHTTP2Server(t *testing.T) {
 	require.NoError(t, CloneAuthed(t.Context(), remote, "", dest, CloneOptions{}))
 	repo, err := git.PlainOpen(dest)
 	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, repo.Close()) })
+	t.Cleanup(func() { require.NoError(t, repo.Storer.(*filesystem.Storage).Close()) })
 	_, err = repo.CommitObject(plumbing.NewHash(commit))
 	require.NoError(t, err)
 }
@@ -298,7 +299,7 @@ func TestCloneRefSelection(t *testing.T) {
 			require.NoError(t, CloneAuthed(t.Context(), remote, "", dest, tc.options))
 			repo, err := git.PlainOpen(dest)
 			require.NoError(t, err)
-			t.Cleanup(func() { require.NoError(t, repo.Close()) })
+			t.Cleanup(func() { require.NoError(t, repo.Storer.(*filesystem.Storage).Close()) })
 			_, err = repo.Worktree()
 			require.ErrorIs(t, err, git.ErrIsBareRepository)
 			require.NoFileExists(t, filepath.Join(dest, "content.txt"))
@@ -401,11 +402,12 @@ func TestClonePublishedRefsWithoutBranches(t *testing.T) {
 			require.NoError(t, CloneAuthed(t.Context(), remote, "", dest, CloneOptions{}))
 			repo, err := git.PlainOpen(dest)
 			require.NoError(t, err)
-			t.Cleanup(func() { require.NoError(t, repo.Close()) })
-			if kind == "tag-only" || kind == "detached-published" {
+			t.Cleanup(func() { require.NoError(t, repo.Storer.(*filesystem.Storage).Close()) })
+			switch kind {
+			case "tag-only", "detached-published":
 				_, err := repo.CommitObject(id)
 				require.NoError(t, err)
-			} else if kind == "review-only" || kind == "detached-review" {
+			case "review-only", "detached-review":
 				require.ErrorIs(t, repo.Storer.HasEncodedObject(id), plumbing.ErrObjectNotFound)
 			}
 			if kind == "detached-published" {

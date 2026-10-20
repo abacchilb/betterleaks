@@ -10,17 +10,13 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/go-git/go-billy/v6"
-	"github.com/go-git/go-billy/v6/osfs"
-	git "github.com/go-git/go-git/v6"
-	"github.com/go-git/go-git/v6/plumbing"
-	"github.com/go-git/go-git/v6/plumbing/cache"
-	"github.com/go-git/go-git/v6/storage/filesystem"
-	"github.com/go-git/go-git/v6/storage/filesystem/dotgit"
+	"github.com/betterleaks/betterleaks/v2/internal/gitfs"
+	"github.com/betterleaks/betterleaks/v2/internal/gitobj"
+	"github.com/go-git/go-billy/v5"
 )
 
 //nolint:exhaustruct // Unspecified storage options and cache bookkeeping use their zero values.
-func (s *Source) open(ctx context.Context) (*git.Repository, func(), error) {
+func (s *Source) open(ctx context.Context) (*repository, func(), error) {
 	l, err := discover(s.RepoPath)
 	if err != nil {
 		return nil, nil, err
@@ -36,19 +32,45 @@ func (s *Source) open(ctx context.Context) (*git.Repository, func(), error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	if !s.AllowExternalObjects {
-		for _, path := range alternates {
+	// Alternate object directories may themselves have alternates. Validate
+	// every hop before opening it, and stop cycles without rereading a store.
+	seen := map[string]bool{l.common + string(filepath.Separator) + "objects": true}
+	var objectDirs []string
+	for len(alternates) > 0 {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
+		path := alternates[0]
+		alternates = alternates[1:]
+		if !s.AllowExternalObjects {
 			if inside, err := within(root, path); err != nil || !inside {
 				return nil, nil, errors.Join(err, fmt.Errorf("%w: %s", ErrExternalStore, path))
 			}
 		}
+		path, err = filepath.EvalSymlinks(path)
+		if err != nil {
+			return nil, nil, err
+		}
+		if seen[path] {
+			continue
+		}
+		if len(seen) >= 4096 {
+			return nil, nil, errors.New("git alternate directories exceed 4096")
+		}
+		seen[path] = true
+		objectDirs = append(objectDirs, path)
+		nested, err := readAlternates(alternateFS(path))
+		if err != nil {
+			return nil, nil, err
+		}
+		alternates = append(alternates, nested...)
 	}
-	dot := osfs.New(l.gitDir, osfs.WithBoundOS())
+	dot := gitfs.New(l.gitDir)
 	var common billy.Filesystem
 	if l.common != l.gitDir {
-		common = osfs.New(l.common, osfs.WithBoundOS())
+		common = gitfs.New(l.common)
 	}
-	fs := readOnlyFS{Filesystem: dotgit.NewRepositoryFilesystem(dot, common), objectRoot: l.common}
+	fs := readOnlyFS{Filesystem: repositoryFS{Filesystem: dot, common: common}, objectRoot: l.common}
 	shallow, err := readShallow(fs)
 	if err != nil {
 		return nil, nil, err
@@ -57,34 +79,28 @@ func (s *Source) open(ctx context.Context) (*git.Repository, func(), error) {
 	if budget == 0 {
 		budget = 256
 	}
-	// Billy confines absolute paths to its root, and alternates can lie outside
-	// the Git directory, so alternate reads get a filesystem root. Confinement
-	// above has already checked each alternate path.
-	volumeRoot := filepath.VolumeName(l.common) + string(filepath.Separator)
-	altFS := readOnlyFS{Filesystem: osfs.New(volumeRoot), objectRoot: volumeRoot}
-	objects := &objectCache{cache.NewObjectLRU(cache.FileSize(budget) << 20)}
-	store := filesystem.NewStorageWithOptions(fs, objects, filesystem.Options{LargeObjectThreshold: 1 << 20, AlternatesFS: altFS})
-	reader := &objectStorage{Storage: store, objects: objects, ctx: ctx, limit: max(s.MaxBlobBytes, defaultMaxBlobBytes), shallow: shallow}
+	objects := &objectCache{gitobj.NewObjectLRU(gitobj.FileSize(budget) << 20)}
+	reader := &objectStorage{fs: fs, objects: objects, ctx: ctx, limit: max(s.MaxBlobBytes, defaultMaxBlobBytes), shallow: shallow}
+	if err := reader.loadConfig(); err != nil {
+		return nil, nil, err
+	}
+	for _, path := range objectDirs {
+		reader.alternates = append(reader.alternates, alternateFS(path))
+	}
+
 	if s.DiskCacheMiB > 0 {
 		reader.disk = &diskObjectCache{segmentSize: int64(s.DiskCacheMiB) << 20 / 8}
 	}
 	if err := reader.openPacks(fs); err != nil {
 		reader.closePacks()
-		store.Close()
 		return nil, nil, err
 	}
-	r, err := git.Open(reader, nil)
-	if err != nil {
-		reader.closePacks()
-		store.Close()
-		return nil, nil, err
-	}
-	return r, func() { reader.closePacks(); store.Close() }, nil
+	return &repository{Storer: reader}, reader.closePacks, nil
 }
 
 // readShallow lists the boundary commits of a shallow clone. Like Git, the
 // source treats them as root commits: their parents were never fetched.
-func readShallow(fs billy.Filesystem) (map[plumbing.Hash]struct{}, error) {
+func readShallow(fs billy.Filesystem) (map[gitobj.Hash]struct{}, error) {
 	data, err := readLimited(fs, "shallow", maxShallowBytes)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
@@ -92,16 +108,16 @@ func readShallow(fs billy.Filesystem) (map[plumbing.Hash]struct{}, error) {
 	if err != nil {
 		return nil, err
 	}
-	ids := make(map[plumbing.Hash]struct{})
+	ids := make(map[gitobj.Hash]struct{})
 	for line := range strings.SplitSeq(data, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
-		if !plumbing.IsHash(line) {
+		if !gitobj.IsHash(line) {
 			return nil, errors.New("malformed Git shallow file")
 		}
-		ids[plumbing.NewHash(line)] = struct{}{}
+		ids[gitobj.NewHash(line)] = struct{}{}
 	}
 	return ids, nil
 }
@@ -136,15 +152,18 @@ type readOnlyFS struct {
 func (f readOnlyFS) Open(path string) (billy.File, error) {
 	fs := f.Filesystem
 	if strings.HasPrefix(filepath.ToSlash(path), "objects/pack/") && (strings.HasSuffix(path, ".idx") || strings.HasSuffix(path, ".rev") || strings.HasSuffix(path, ".pack")) {
-		fs = osfs.New(f.objectRoot, osfs.WithMmap())
+		fs = gitfs.New(f.objectRoot, gitfs.WithMmap())
+		if _, alternate := f.Filesystem.(objectDirectoryFS); alternate {
+			path = objectPath(path)
+		}
 	}
-	// osfs opens through os.Root, so symlinks cannot leave the repository. A FIFO
+	// gitfs opens through os.Root, so symlinks cannot leave the repository. A FIFO
 	// or device would block or never end; open without waiting and reject it.
 	file, err := fs.OpenFile(path, os.O_RDONLY|nonBlocking, 0)
 	if err != nil {
 		return nil, err
 	}
-	if info, err := file.Stat(); err != nil || !info.Mode().IsRegular() {
+	if info, err := file.(interface{ Stat() (os.FileInfo, error) }).Stat(); err != nil || !info.Mode().IsRegular() {
 		file.Close()
 		return nil, errors.Join(err, fmt.Errorf("git storage %q is not a regular file", path))
 	}
@@ -152,16 +171,21 @@ func (f readOnlyFS) Open(path string) (billy.File, error) {
 }
 
 // Git ignores dotfiles in ref directories (for example fixture .gitkeep files).
-func (f readOnlyFS) ReadDir(path string) ([]os.DirEntry, error) {
+func (f readOnlyFS) ReadDir(path string) ([]os.FileInfo, error) {
+	clean := filepath.ToSlash(filepath.Clean(path))
+	if strings.HasPrefix(clean, "objects/") && len(clean) == len("objects/00") {
+		if info, err := f.Lstat(path); err == nil && !info.IsDir() {
+			return nil, fmt.Errorf("loose object directory %q is not a directory", path)
+		}
+	}
 	// Listing opens the path, which would block on a FIFO.
-	if info, err := f.Filesystem.Stat(path); err == nil && !info.IsDir() {
+	if info, err := f.Stat(path); err == nil && !info.IsDir() {
 		return nil, fmt.Errorf("git storage %q is not a directory", path)
 	}
 	entries, err := f.Filesystem.ReadDir(path)
 	if err != nil {
 		return nil, err
 	}
-	clean := filepath.ToSlash(filepath.Clean(path))
 	// Object enumeration must not silently skip a linked fanout directory or
 	// follow a loose object symlink/FIFO while looking for abandoned content.
 	if clean == "objects" {
@@ -175,7 +199,7 @@ func (f readOnlyFS) ReadDir(path string) ([]os.DirEntry, error) {
 	} else if strings.HasPrefix(clean, "objects/") && len(clean) == len("objects/00") {
 		prefix := strings.TrimPrefix(clean, "objects/")
 		for _, entry := range entries {
-			if plumbing.IsHash(prefix+entry.Name()) && !entry.Type().IsRegular() {
+			if gitobj.IsHash(prefix+entry.Name()) && !entry.Mode().IsRegular() {
 				return nil, fmt.Errorf("loose object %s is not a regular file", prefix+entry.Name())
 			}
 		}

@@ -12,77 +12,96 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/betterleaks/betterleaks/v2/internal/gitobj"
 	"github.com/betterleaks/betterleaks/v2/internal/gitpack"
-	"github.com/go-git/go-git/v6/plumbing"
-	"github.com/go-git/go-git/v6/plumbing/format/idxfile"
-	"github.com/go-git/go-git/v6/x/fdpool"
 )
 
-// Packs beyond this many use go-git's reader. Each mapped pack holds two file
-// handles, and repositories with this many packs are due for a repack anyway.
-const maxMappedPacks = 32
-
 type objectPack struct {
-	index    *idxfile.LazyIndex
-	file     idxfile.ReadAtCloser
+	index *gitobj.Index
+	file  interface {
+		io.ReaderAt
+		io.Closer
+	}
 	end      int64
 	hashSize int
 }
 
 func (s *objectStorage) openPacks(fs readOnlyFS) error {
-	ids, err := s.ObjectPacks()
-	if err != nil {
-		return err
-	}
-	pool := fdpool.New(64)
-	for _, id := range ids[:min(len(ids), maxMappedPacks)] {
-		if err := s.ctx.Err(); err != nil {
-			return err
-		}
-		path := "objects/pack/pack-" + id.String()
-		index, err := idxfile.NewLazyIndexWithPool(
-			func() (idxfile.ReadAtCloser, error) { return fs.Open(path + ".idx") },
-			func() (idxfile.ReadAtCloser, error) { return fs.Open(path + ".rev") }, id, pool)
+	for _, fs := range append([]readOnlyFS{fs}, s.alternates...) {
+		entries, err := fs.ReadDir("objects/pack")
 		if errors.Is(err, os.ErrNotExist) {
 			continue
 		}
 		if err != nil {
 			return err
 		}
-		f, err := fs.Open(path + ".pack")
-		if err != nil {
-			index.Close()
-			return err
-		}
-		end, err := f.Seek(0, io.SeekEnd)
-		if err != nil {
-			f.Close()
-			index.Close()
-			return err
-		}
-		p := &objectPack{index: index, file: f, end: end - int64(id.Size()), hashSize: id.Size()}
-		s.packs = append(s.packs, p)
-		var header [12]byte
-		if _, err := f.ReadAt(header[:], 0); err != nil {
-			return err
-		}
-		version := binary.BigEndian.Uint32(header[4:8])
-		if string(header[:4]) != "PACK" || (version != 2 && version != 3) {
-			return errors.New("invalid git pack header")
-		}
-		count, err := index.Count()
-		if err != nil {
-			return err
-		}
-		if int64(binary.BigEndian.Uint32(header[8:])) != count {
-			return errors.New("git pack/index object count mismatch")
-		}
-		var footer [32]byte
-		if _, err := f.ReadAt(footer[:id.Size()], p.end); err != nil {
-			return err
-		}
-		if id.Compare(footer[:id.Size()]) != 0 {
-			return errors.New("git pack/index checksum mismatch")
+		for _, entry := range entries {
+			if err := s.ctx.Err(); err != nil {
+				return err
+			}
+			name := entry.Name()
+			if !strings.HasPrefix(name, "pack-") || !strings.HasSuffix(name, ".idx") {
+				continue
+			}
+			hex := strings.TrimSuffix(strings.TrimPrefix(name, "pack-"), ".idx")
+			if !gitobj.IsHash(hex) || len(hex) != gitobj.FromObjectFormat(s.cfg.Extensions.ObjectFormat).Size()*2 {
+				return errors.New("invalid pack filename")
+			}
+			id := gitobj.NewHash(hex)
+			path := "objects/pack/pack-" + hex
+			idx, err := fs.Open(path + ".idx")
+			if err != nil {
+				return err
+			}
+			rev, err := fs.Open(path + ".rev")
+			if err != nil && !errors.Is(err, os.ErrNotExist) {
+				idx.Close()
+				return err
+			}
+			index, err := gitobj.OpenIndex(s.ctx, idx, rev, id)
+			if err != nil {
+				idx.Close()
+				if rev != nil {
+					rev.Close()
+				}
+				return err
+			}
+
+			f, err := fs.Open(path + ".pack")
+			if err != nil {
+				index.Close()
+				return err
+			}
+			end, err := f.Seek(0, io.SeekEnd)
+			if err != nil {
+				f.Close()
+				index.Close()
+				return err
+			}
+			p := &objectPack{index: index, file: f, end: end - int64(id.Size()), hashSize: id.Size()}
+			s.packs = append(s.packs, p)
+			var header [12]byte
+			if _, err := f.ReadAt(header[:], 0); err != nil {
+				return err
+			}
+			version := binary.BigEndian.Uint32(header[4:8])
+			if string(header[:4]) != "PACK" || (version != 2 && version != 3) {
+				return errors.New("invalid git pack header")
+			}
+			count, err := index.Count()
+			if err != nil {
+				return err
+			}
+			if int64(binary.BigEndian.Uint32(header[8:])) != count {
+				return errors.New("git pack/index object count mismatch")
+			}
+			var footer [32]byte
+			if _, err := f.ReadAt(footer[:id.Size()], p.end); err != nil {
+				return err
+			}
+			if id.Compare(footer[:id.Size()]) != 0 {
+				return errors.New("git pack/index checksum mismatch")
+			}
 		}
 	}
 	return nil
@@ -103,15 +122,17 @@ type packInflater struct {
 	buffer [32 << 10]byte
 }
 
-var packInflaters = sync.Pool{New: func() any { return &packInflater{input: bufio.NewReaderSize(nil, 8192)} }}
+var packInflaters = sync.Pool{New: func() any {
+	return &packInflater{input: bufio.NewReaderSize(nil, 8192), reader: nil, buffer: [32 << 10]byte{}}
+}}
 
 // readPacked reconstructs a packed object. It walks the delta chain down to a
 // cached or undeltified base reading only record headers, then inflates and
 // applies one delta at a time back up. Chain depth costs one position per
 // link, never stack frames or retained delta instructions.
-func (s *objectStorage) readPacked(p *objectPack, offset int64, id plumbing.Hash) (*storedObject, error) {
+func (s *objectStorage) readPacked(p *objectPack, offset int64, id gitobj.Hash) (*storedObject, error) {
 	type link struct {
-		id     plumbing.Hash
+		id     gitobj.Hash
 		pack   *objectPack
 		offset int64
 	}
@@ -142,7 +163,7 @@ func (s *objectStorage) readPacked(p *objectPack, offset int64, id plumbing.Hash
 			return nil, fmt.Errorf("git delta chain for %s exceeds %d links", chain[0].id, maxDeltaChain)
 		}
 		chain = append(chain, link{id, p, offset})
-		if e.kind == plumbing.OFSDeltaObject {
+		if e.kind == gitobj.OFSDeltaObject {
 			offset = e.baseOffset
 			if id, err = p.index.FindHash(offset); err != nil {
 				return nil, err
@@ -181,9 +202,9 @@ func (s *objectStorage) readPacked(p *objectPack, offset int64, id plumbing.Hash
 // packEntry is one inflated pack record. Deltas name their base by offset
 // (OFS) or by object ID (REF).
 type packEntry struct {
-	kind       plumbing.ObjectType
+	kind       gitobj.ObjectType
 	baseOffset int64
-	baseID     plumbing.Hash
+	baseID     gitobj.Hash
 	raw        string
 }
 

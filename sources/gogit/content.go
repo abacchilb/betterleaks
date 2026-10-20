@@ -7,15 +7,14 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/betterleaks/betterleaks/v2/internal/gitobj"
 	"github.com/betterleaks/betterleaks/v2/sources"
-	"github.com/go-git/go-git/v6/plumbing"
-	"github.com/go-git/go-git/v6/plumbing/filemode"
-	"github.com/go-git/go-git/v6/plumbing/object"
+	"github.com/go-git/go-git/v5/plumbing/filemode"
 	"github.com/mholt/archives"
 	"github.com/sergi/go-diff/diffmatchpatch"
 )
 
-func (w *worker) change(ctx context.Context, c *object.Change, attrs map[string]string, yield sources.FragmentsFunc) error {
+func (w *worker) change(ctx context.Context, c *gitobj.Change, attrs map[string]string, yield sources.FragmentsFunc) error {
 	emit := func(raw string, line int) error {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -167,7 +166,7 @@ func (d *lineDiffer) additions(ctx context.Context, src, dst string, emit func(s
 			clear(ids)
 		}
 		if oldCount > 65536 || newCount > 65536 {
-			*d = lineDiffer{}
+			*d = lineDiffer{} //nolint:exhaustruct // Drop every retained buffer after a large diff.
 		}
 	}()
 	d.classes = resize(d.classes, oldCount+newCount)
@@ -439,7 +438,7 @@ func searchable(classes []byte, i int) bool {
 	return common*4 >= common+before+after
 }
 
-func (w *worker) content(ctx context.Context, e object.ChangeEntry) (string, bool, error) {
+func (w *worker) content(ctx context.Context, e gitobj.ChangeEntry) (string, bool, error) {
 	if e.TreeEntry.Mode == filemode.Submodule {
 		return "Subproject commit " + e.TreeEntry.Hash.String() + "\n", false, nil
 	}
@@ -450,8 +449,8 @@ func (w *worker) content(ctx context.Context, e object.ChangeEntry) (string, boo
 	if err != nil {
 		return "", false, err
 	}
-	if obj.kind != plumbing.BlobObject {
-		return "", false, plumbing.ErrObjectNotFound
+	if obj.kind != gitobj.BlobObject {
+		return "", false, gitobj.ErrObjectNotFound
 	}
 	if obj.Size() > w.maxBlob {
 		return "", false, limitf("blob %s size %d exceeds limit %d", e.TreeEntry.Hash, obj.Size(), w.maxBlob)
@@ -459,7 +458,7 @@ func (w *worker) content(ctx context.Context, e object.ChangeEntry) (string, boo
 	return obj.raw, strings.IndexByte(obj.raw[:min(len(obj.raw), binarySniffBytes)], 0) >= 0, nil
 }
 
-func (w *worker) archive(ctx context.Context, e object.ChangeEntry, attrs map[string]string, yield sources.FragmentsFunc) error {
+func (w *worker) archive(ctx context.Context, e gitobj.ChangeEntry, attrs map[string]string, yield sources.FragmentsFunc) error {
 	if w.source.MaxArchiveDepth <= 0 {
 		return nil
 	}
@@ -483,6 +482,6 @@ func (w *worker) archive(ctx context.Context, e object.ChangeEntry, attrs map[st
 	}
 	defer r.Close()
 	// Match filesystem scans: damaged archives warn without failing history traversal.
-	source := sources.File{Logger: w.source.Logger, Content: contextReader{ctx, r}, Path: e.Name, Attributes: attrs, Prefilter: w.source.Prefilter, MaxArchiveDepth: w.source.MaxArchiveDepth, StrictArchives: false}
+	source := sources.File{Logger: w.source.Logger, Content: contextReader{ctx, r}, Path: e.Name, Attributes: attrs, Prefilter: w.source.Prefilter, MaxArchiveDepth: w.source.MaxArchiveDepth, StrictArchives: false, Symlink: "", DetectArchive: false}
 	return source.Fragments(ctx, yield)
 }

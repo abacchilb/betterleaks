@@ -8,52 +8,29 @@ import (
 	"strings"
 	"sync"
 
-	git "github.com/go-git/go-git/v6"
-	"github.com/go-git/go-git/v6/plumbing"
-	"github.com/go-git/go-git/v6/plumbing/cache"
-	"github.com/go-git/go-git/v6/plumbing/format/packfile"
-	"github.com/go-git/go-git/v6/plumbing/object"
+	"github.com/betterleaks/betterleaks/v2/internal/gitobj"
 )
 
-// FSObject.Size reports content size, but its reader closure retains a Packfile
-// and scanner buffers. Caching tiny commits this way can turn a 96 MiB cache
-// into gigabytes. Keep materialized objects (including reconstructed delta
-// bases) and let these storage handles go after each read. Their
-// contents would still need decompression on every Reader call, even if cached.
-type objectCache struct{ *cache.ObjectLRU }
+// Only materialized immutable objects enter the cache. The LRU computes an
+// object's hash before taking its mutex, so a large unpublished object cannot
+// block concurrent cache hits.
+type objectCache struct{ *gitobj.ObjectLRU }
 
-func (c *objectCache) Put(obj plumbing.EncodedObject) {
-	if _, lazy := obj.(*packfile.FSObject); lazy {
-		return
-	}
-	if cache.FileSize(obj.Size()) > c.MaxSize {
-		return
-	}
-	// Upstream's LRU calls Hash while holding its global mutex. Hashing a
-	// reconstructed blob can scan megabytes and block every cache lookup.
-	// Materialized objects are private to their decoder until this publication;
-	// compute their memoized hash before entering the cache's critical section.
-	obj.Hash()
-	c.ObjectLRU.Put(obj)
-}
-
-// Only Entries and Hash are shared. Never call Tree.FindEntry/Tree.Tree on a
-// cached tree: those methods can lazily mutate the tree's internal path cache.
-// 32 MiB includes an estimate for decoded entries, names, and cache overhead.
+// The decoded-tree budget includes entries, names, and cache overhead.
 type treeCache struct {
 	mu      sync.Mutex
-	entries map[plumbing.Hash]*list.Element
+	entries map[gitobj.Hash]*list.Element
 	lru     list.List
 	bytes   int
-	r       *git.Repository
+	r       *repository
 }
 type cachedTree struct {
-	id    plumbing.Hash
-	tree  *object.Tree
+	id    gitobj.Hash
+	tree  *gitobj.Tree
 	bytes int
 }
 
-func (c *treeCache) get(id plumbing.Hash) (*object.Tree, error) {
+func (c *treeCache) get(id gitobj.Hash) (*gitobj.Tree, error) {
 	c.mu.Lock()
 	if e := c.entries[id]; e != nil {
 		c.lru.MoveToFront(e)
@@ -68,7 +45,7 @@ func (c *treeCache) get(id plumbing.Hash) (*object.Tree, error) {
 	}
 	// Count allocated slice capacity, not only its populated entries. Go's
 	// append growth can otherwise undercharge large decoded trees substantially.
-	size := 256 + cap(t.Entries)*int(reflect.TypeFor[object.TreeEntry]().Size())
+	size := 256 + cap(t.Entries)*int(reflect.TypeFor[gitobj.TreeEntry]().Size())
 	for _, entry := range t.Entries {
 		size += (len(entry.Name) + 15) &^ 15
 	}
@@ -78,7 +55,7 @@ func (c *treeCache) get(id plumbing.Hash) (*object.Tree, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.entries == nil {
-		c.entries = make(map[plumbing.Hash]*list.Element)
+		c.entries = make(map[gitobj.Hash]*list.Element)
 	}
 	if e := c.entries[id]; e != nil {
 		c.lru.MoveToFront(e)
@@ -109,7 +86,7 @@ type patchCache struct {
 	misses  uint64
 }
 
-type patchKey struct{ from, to plumbing.Hash }
+type patchKey struct{ from, to gitobj.Hash }
 type textAddition struct {
 	raw  string
 	line int
@@ -178,17 +155,17 @@ type diskObjectCache struct {
 	segmentSize int64
 	segment     int
 	used        int64
-	entries     map[plumbing.Hash]diskObject
-	keys        [8][]plumbing.Hash
+	entries     map[gitobj.Hash]diskObject
+	keys        [8][]gitobj.Hash
 }
 
 type diskObject struct {
 	offset int64
 	size   int64
-	kind   plumbing.ObjectType
+	kind   gitobj.ObjectType
 }
 
-func (c *diskObjectCache) get(id plumbing.Hash) (*storedObject, bool) {
+func (c *diskObjectCache) get(id gitobj.Hash) (*storedObject, bool) {
 	if c == nil {
 		return nil, false
 	}
@@ -232,7 +209,7 @@ func (c *diskObjectCache) put(o *storedObject) {
 		// the cache. Platforms that forbid unlinking an open file use close's
 		// removal instead. All cache access uses the existing descriptor.
 		_ = os.Remove(f.Name())
-		c.entries = make(map[plumbing.Hash]diskObject)
+		c.entries = make(map[gitobj.Hash]diskObject)
 	}
 	if c.used+o.Size() > c.segmentSize {
 		c.segment = (c.segment + 1) % len(c.keys)

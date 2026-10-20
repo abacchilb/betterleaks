@@ -16,19 +16,17 @@ import (
 	"testing"
 	"time"
 
-	format "github.com/go-git/go-git/v6/plumbing/format/config"
-
+	"github.com/betterleaks/betterleaks/v2/internal/gitobj"
 	"github.com/betterleaks/betterleaks/v2/sources"
-	"github.com/go-git/go-git/v6/plumbing"
-	"github.com/go-git/go-git/v6/plumbing/cache"
-	"github.com/go-git/go-git/v6/plumbing/filemode"
-	"github.com/go-git/go-git/v6/plumbing/format/packfile"
-	"github.com/go-git/go-git/v6/plumbing/object"
+	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/filemode"
+	format "github.com/go-git/go-git/v5/plumbing/format/config"
+	"github.com/go-git/go-git/v5/plumbing/format/packfile"
 	"github.com/stretchr/testify/require"
 )
 
 func diskTestObject(i int) *storedObject {
-	return &storedObject{id: plumbing.NewHash(fmt.Sprintf("%040x", i+1)), kind: plumbing.BlobObject, raw: strings.Repeat(string(rune('a'+i%26)), 1<<20)}
+	return &storedObject{id: gitobj.NewHash(fmt.Sprintf("%040x", i+1)), kind: gitobj.BlobObject, raw: strings.Repeat(string(rune('a'+i%26)), 1<<20)}
 }
 
 func TestDiskObjectCache(t *testing.T) {
@@ -97,7 +95,7 @@ func TestDiskObjectCacheUnavailable(t *testing.T) {
 }
 
 func patchTestKey(i int) patchKey {
-	return patchKey{to: plumbing.NewHash(fmt.Sprintf("%040x", i+1))}
+	return patchKey{to: gitobj.NewHash(fmt.Sprintf("%040x", i+1))}
 }
 
 func TestPatchCacheBoundsAndOwnership(t *testing.T) {
@@ -140,15 +138,15 @@ func TestPatchCacheConcurrent(t *testing.T) {
 }
 
 func TestCachedPatchCallbacks(t *testing.T) {
-	objects := &objectCache{cache.NewObjectLRU(1 << 20)}
-	from := &storedObject{id: plumbing.NewHash(strings.Repeat("1", 40)), kind: plumbing.BlobObject, raw: "first\nold\nlast\n"}
-	to := &storedObject{id: plumbing.NewHash(strings.Repeat("2", 40)), kind: plumbing.BlobObject, raw: "first\nTOKEN\nlast\n"}
+	objects := &objectCache{gitobj.NewObjectLRU(1 << 20)}
+	from := &storedObject{id: gitobj.NewHash(strings.Repeat("1", 40)), kind: gitobj.BlobObject, raw: "first\nold\nlast\n"}
+	to := &storedObject{id: gitobj.NewHash(strings.Repeat("2", 40)), kind: gitobj.BlobObject, raw: "first\nTOKEN\nlast\n"}
 	objects.Put(from)
 	objects.Put(to)
 	w := worker{source: &Source{}, store: &objectStorage{ctx: t.Context(), objects: objects}, patches: &patchCache{}, maxBlob: 1 << 20}
-	change := &object.Change{
-		From: object.ChangeEntry{Name: "old.txt", TreeEntry: object.TreeEntry{Hash: from.id, Mode: filemode.Regular}},
-		To:   object.ChangeEntry{Name: "new.txt", TreeEntry: object.TreeEntry{Hash: to.id, Mode: filemode.Regular}},
+	change := &gitobj.Change{
+		From: gitobj.ChangeEntry{Name: "old.txt", TreeEntry: gitobj.TreeEntry{Hash: from.id, Mode: filemode.Regular}},
+		To:   gitobj.ChangeEntry{Name: "new.txt", TreeEntry: gitobj.TreeEntry{Hash: to.id, Mode: filemode.Regular}},
 	}
 	key := patchKey{from.id, to.id}
 	failed := errors.New("callback failed")
@@ -191,13 +189,13 @@ func TestPatchCachePreservesBinaryArchiveMembers(t *testing.T) {
 	_, err = member.Write([]byte(content))
 	require.NoError(t, err)
 	require.NoError(t, writer.Close())
-	objects := &objectCache{cache.NewObjectLRU(1 << 20)}
-	to := &storedObject{id: plumbing.NewHash(strings.Repeat("2", 40)), kind: plumbing.BlobObject, raw: archive.String()}
+	objects := &objectCache{gitobj.NewObjectLRU(1 << 20)}
+	to := &storedObject{id: gitobj.NewHash(strings.Repeat("2", 40)), kind: gitobj.BlobObject, raw: archive.String()}
 	objects.Put(to)
 	w := worker{source: &Source{MaxArchiveDepth: 1}, store: &objectStorage{ctx: t.Context(), objects: objects}, patches: &patchCache{}, maxBlob: 1 << 20}
-	change := &object.Change{
-		From: object.ChangeEntry{Name: "archive.zip", TreeEntry: object.TreeEntry{Hash: plumbing.NewHash(strings.Repeat("1", 40)), Mode: filemode.Regular}},
-		To:   object.ChangeEntry{Name: "archive.zip", TreeEntry: object.TreeEntry{Hash: to.id, Mode: filemode.Regular}},
+	change := &gitobj.Change{
+		From: gitobj.ChangeEntry{Name: "archive.zip", TreeEntry: gitobj.TreeEntry{Hash: gitobj.NewHash(strings.Repeat("1", 40)), Mode: filemode.Regular}},
+		To:   gitobj.ChangeEntry{Name: "archive.zip", TreeEntry: gitobj.TreeEntry{Hash: to.id, Mode: filemode.Regular}},
 	}
 	for _, commit := range []string{"first-commit", "second-commit"} {
 		var got []sources.Fragment
@@ -216,15 +214,10 @@ func TestPatchCachePreservesBinaryArchiveMembers(t *testing.T) {
 	require.Empty(t, w.patches.entries, "archive extraction must run for every commit")
 }
 
-func TestObjectCacheDoesNotRetainPackReaders(t *testing.T) {
-	c := &objectCache{cache.NewObjectLRU(1024)}
-	id := plumbing.NewHash(strings.Repeat("a", 40))
-	lazy := packfile.NewFSObject(id, plumbing.CommitObject, 0, 1, nil, nil, nil, "", c)
-	c.Put(lazy)
-	_, found := c.Get(id)
-	require.False(t, found)
-	memory := plumbing.NewMemoryObject(plumbing.FromObjectFormat(format.SHA1))
-	memory.SetType(plumbing.BlobObject)
+func TestObjectCacheMaterializedObjects(t *testing.T) {
+	c := &objectCache{gitobj.NewObjectLRU(1024)}
+	memory := gitobj.NewMemoryObject(gitobj.FromObjectFormat(format.SHA1))
+	memory.SetType(gitobj.BlobObject)
 	writer, err := memory.Writer()
 	require.NoError(t, err)
 	_, err = writer.Write([]byte("data"))
@@ -240,7 +233,7 @@ func TestObjectCacheDoesNotRetainPackReaders(t *testing.T) {
 }
 
 func TestCachedTextDeltaBase(t *testing.T) {
-	base := &storedObject{kind: plumbing.BlobObject, raw: "abc"}
+	base := &storedObject{kind: gitobj.BlobObject, raw: "abc"}
 	reader, err := base.Reader()
 	require.NoError(t, err)
 	seeker, ok := reader.(io.Seeker)
@@ -255,34 +248,34 @@ func TestCachedTextDeltaBase(t *testing.T) {
 	require.Error(t, err)
 	// Copy all three source bytes, then append one literal byte. The source's
 	// cached representation must remain usable by go-git's delta reconstruction.
-	target := plumbing.NewMemoryObject(plumbing.FromObjectFormat(format.SHA1))
-	require.NoError(t, packfile.ApplyDelta(target, base, bytes.NewBuffer([]byte{3, 4, 0x90, 3, 1, 'd'})))
+	target := &plumbing.MemoryObject{}
+	require.NoError(t, packfile.ApplyDelta(target, v5TestObject{base}, []byte{3, 4, 0x90, 3, 1, 'd'}))
 	result, err := target.Reader()
 	require.NoError(t, err)
 	defer result.Close()
 	raw, err = io.ReadAll(result)
 	require.NoError(t, err)
 	require.Equal(t, "abcd", string(raw))
-	require.Equal(t, plumbing.BlobObject, base.Type())
+	require.Equal(t, gitobj.BlobObject, base.Type())
 	require.Equal(t, int64(3), base.Size())
 }
 
 type slowHashObject struct {
-	plumbing.EncodedObject
+	gitobj.EncodedObject
 	entered, release chan struct{}
 	once             sync.Once
 }
 
-func (o *slowHashObject) Hash() plumbing.Hash {
+func (o *slowHashObject) Hash() gitobj.Hash {
 	o.once.Do(func() { close(o.entered); <-o.release })
 	return o.EncodedObject.Hash()
 }
 
 func TestObjectHashDoesNotBlockCache(t *testing.T) {
-	c := &objectCache{cache.NewObjectLRU(1024)}
-	seed := &storedObject{kind: plumbing.BlobObject, id: plumbing.NewHash(strings.Repeat("1", 40)), raw: "seed"}
+	c := &objectCache{gitobj.NewObjectLRU(1024)}
+	seed := &storedObject{kind: gitobj.BlobObject, id: gitobj.NewHash(strings.Repeat("1", 40)), raw: "seed"}
 	c.Put(seed)
-	obj := &slowHashObject{EncodedObject: &storedObject{kind: plumbing.BlobObject, id: plumbing.NewHash(strings.Repeat("2", 40)), raw: "slow"}, entered: make(chan struct{}), release: make(chan struct{})}
+	obj := &slowHashObject{EncodedObject: &storedObject{kind: gitobj.BlobObject, id: gitobj.NewHash(strings.Repeat("2", 40)), raw: "slow"}, entered: make(chan struct{}), release: make(chan struct{})}
 	put := make(chan struct{})
 	defer func() { close(obj.release); <-put }()
 	go func() { c.Put(obj); close(put) }()
@@ -296,3 +289,7 @@ func TestObjectHashDoesNotBlockCache(t *testing.T) {
 		t.Fatal("hashing an unpublished object blocked unrelated cache lookup")
 	}
 }
+
+type v5TestObject struct{ gitobj.EncodedObject }
+
+func (o v5TestObject) Hash() plumbing.Hash { return plumbing.NewHash(o.EncodedObject.Hash().String()) }

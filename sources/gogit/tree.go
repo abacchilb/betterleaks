@@ -2,18 +2,15 @@ package gogit
 
 import (
 	"context"
-	"path"
-	"slices"
 	"strings"
 
-	"github.com/go-git/go-git/v6/plumbing"
-	"github.com/go-git/go-git/v6/plumbing/filemode"
-	"github.com/go-git/go-git/v6/plumbing/object"
+	"github.com/betterleaks/betterleaks/v2/internal/gitobj"
+	"github.com/go-git/go-git/v5/plumbing/filemode"
 )
 
 // treeChanges compares a commit's tree with its first parent's, or with the
 // empty tree when parent is zero, and pairs renamed files.
-func treeChanges(ctx context.Context, cache *treeCache, c *object.Commit, parent plumbing.Hash) (object.Changes, error) {
+func treeChanges(ctx context.Context, cache *treeCache, c *gitobj.Commit, parent gitobj.Hash) (gitobj.Changes, error) {
 	changes, err := rawTreeChanges(ctx, cache, c, parent)
 	if err != nil {
 		return nil, err
@@ -28,37 +25,22 @@ func treeChanges(ctx context.Context, cache *treeCache, c *object.Commit, parent
 	return paired, err
 }
 
-// detectRenames pairs similar deletions and additions. go-git's detector opens
-// each blob through Tree.TreeEntryFile, which rejects names that are unsafe to
-// check out (for example a literal backslash, as in GitLab's history). This
-// source never checks anything out and only reads blobs by ID, so the entries
-// get a placeholder name for the detector; ChangeEntry.Name keeps the real path
-// used for scoring and metadata, and the entry names are restored afterwards.
-// go-git offers no option to skip that validation.
-func detectRenames(changes object.Changes) (object.Changes, error) {
-	for _, change := range changes {
-		if change.From.Name != "" {
-			change.From.TreeEntry.Name = "blob"
-		}
-		if change.To.Name != "" {
-			change.To.TreeEntry.Name = "blob"
-		}
+// detectRenames keeps v5's similarity scoring. gitobj adapts its hash model
+// without truncating SHA-256 IDs and uses safe placeholder names for blob reads.
+func detectRenames(changes gitobj.Changes) (gitobj.Changes, error) {
+	var added, deleted bool
+	for _, c := range changes {
+		added = added || c.From.Name == ""
+		deleted = deleted || c.To.Name == ""
 	}
-	paired, err := object.DetectRenames(changes, &object.DiffTreeOptions{DetectRenames: true, RenameScore: 50, RenameLimit: 1000, OnlyExactRenames: false})
-	// Restore the input too: on error it is all the caller has.
-	for _, change := range slices.Concat(changes, paired) {
-		if change.From.Name != "" {
-			change.From.TreeEntry.Name = path.Base(change.From.Name)
-		}
-		if change.To.Name != "" {
-			change.To.TreeEntry.Name = path.Base(change.To.Name)
-		}
+	if !added || !deleted {
+		return changes, nil
 	}
-	return paired, err
+	return gitobj.DetectRenames(changes, &gitobj.DiffTreeOptions{DetectRenames: true, RenameScore: 50, RenameLimit: 1000, OnlyExactRenames: false})
 }
 
-func rawTreeChanges(ctx context.Context, cache *treeCache, c *object.Commit, parent plumbing.Hash) (object.Changes, error) {
-	var old *object.Tree
+func rawTreeChanges(ctx context.Context, cache *treeCache, c *gitobj.Commit, parent gitobj.Hash) (gitobj.Changes, error) {
+	var old *gitobj.Tree
 	if !parent.IsZero() {
 		p, err := cache.r.CommitObject(parent)
 		if err != nil {
@@ -75,7 +57,7 @@ func rawTreeChanges(ctx context.Context, cache *treeCache, c *object.Commit, par
 	if err != nil {
 		return nil, err
 	}
-	var changes object.Changes
+	var changes gitobj.Changes
 	// A small tree DAG can expand into exponentially many paths. Bound each
 	// comparison (workers release it before taking another commit), including
 	// empty directories and path bytes, not just the number of unique objects.
@@ -88,8 +70,8 @@ func rawTreeChanges(ctx context.Context, cache *treeCache, c *object.Commit, par
 		}
 		return ctx.Err()
 	}
-	var walk func(*object.Tree, *object.Tree, string) error
-	expand := func(tree *object.Tree, entry object.TreeEntry, prefix string, added bool) error {
+	var walk func(*gitobj.Tree, *gitobj.Tree, string) error
+	expand := func(tree *gitobj.Tree, entry gitobj.TreeEntry, prefix string, added bool) error {
 		if err := charge(len(prefix) + len(entry.Name)); err != nil {
 			return err
 		}
@@ -104,8 +86,8 @@ func rawTreeChanges(ctx context.Context, cache *treeCache, c *object.Commit, par
 			}
 			return walk(sub, nil, name+"/")
 		}
-		change := &object.Change{}
-		value := object.ChangeEntry{Name: name, Tree: tree, TreeEntry: entry}
+		change := new(gitobj.Change)
+		value := gitobj.ChangeEntry{Name: name, Tree: tree, TreeEntry: entry}
 		if added {
 			change.To = value
 		} else {
@@ -114,7 +96,7 @@ func rawTreeChanges(ctx context.Context, cache *treeCache, c *object.Commit, par
 		changes = append(changes, change)
 		return nil
 	}
-	walk = func(from, to *object.Tree, prefix string) error {
+	walk = func(from, to *gitobj.Tree, prefix string) error {
 		if strings.Count(prefix, "/") > maxTreeDepth {
 			return limitf("tree nesting exceeds %d levels", maxTreeDepth)
 		}
@@ -124,7 +106,7 @@ func rawTreeChanges(ctx context.Context, cache *treeCache, c *object.Commit, par
 		if from != nil && to != nil && from.Hash == to.Hash {
 			return nil
 		}
-		var a, b []object.TreeEntry
+		var a, b []gitobj.TreeEntry
 		if from != nil {
 			a = from.Entries
 		}
@@ -180,7 +162,7 @@ func rawTreeChanges(ctx context.Context, cache *treeCache, c *object.Commit, par
 						return err
 					}
 				} else {
-					changes = append(changes, &object.Change{From: object.ChangeEntry{Name: prefix + left.Name, Tree: from, TreeEntry: left}, To: object.ChangeEntry{Name: prefix + right.Name, Tree: to, TreeEntry: right}})
+					changes = append(changes, &gitobj.Change{From: gitobj.ChangeEntry{Name: prefix + left.Name, Tree: from, TreeEntry: left}, To: gitobj.ChangeEntry{Name: prefix + right.Name, Tree: to, TreeEntry: right}})
 				}
 				continue
 			}

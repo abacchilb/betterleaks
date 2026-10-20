@@ -7,8 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/go-git/go-billy/v6/osfs"
-	git "github.com/go-git/go-git/v6"
+	"github.com/betterleaks/betterleaks/v2/internal/gitfs"
+	git "github.com/go-git/go-git/v5"
 )
 
 // ErrExternalStore reports Git storage outside the scanned repository. A
@@ -156,7 +156,11 @@ func (l layout) registeredWorktree() (string, bool) {
 
 // alternates lists the object directories named by objects/info/alternates.
 func (l layout) alternates() ([]string, error) {
-	data, err := readLimited(storageFS(l.common), "objects/info/alternates", maxAlternatesBytes)
+	return readAlternates(storageFS(l.common))
+}
+
+func readAlternates(fs readOnlyFS) ([]string, error) {
+	data, err := readLimited(fs, "objects/info/alternates", maxAlternatesBytes)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
 	}
@@ -169,7 +173,7 @@ func (l layout) alternates() ([]string, error) {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		// go-git resolves relative alternates from the wrong directory.
+		// Preserve the source's existing absolute-alternate contract.
 		if !filepath.IsAbs(line) {
 			return nil, errors.New("relative object alternates are not supported")
 		}
@@ -207,5 +211,5 @@ func readSmallFile(path string) (string, error) {
 }
 
 func storageFS(root string) readOnlyFS {
-	return readOnlyFS{Filesystem: osfs.New(root), objectRoot: root}
+	return readOnlyFS{Filesystem: gitfs.New(root), objectRoot: root}
 }

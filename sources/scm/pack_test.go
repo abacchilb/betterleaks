@@ -18,15 +18,15 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/go-git/go-billy/v6"
-	"github.com/go-git/go-billy/v6/osfs"
-	git "github.com/go-git/go-git/v6"
-	"github.com/go-git/go-git/v6/plumbing"
-	format "github.com/go-git/go-git/v6/plumbing/format/config"
-	"github.com/go-git/go-git/v6/plumbing/format/idxfile"
-	"github.com/go-git/go-git/v6/plumbing/format/packfile"
-	githash "github.com/go-git/go-git/v6/plumbing/hash"
-	"github.com/go-git/go-git/v6/storage/filesystem"
+	"github.com/betterleaks/betterleaks/v2/internal/gitfs"
+	"github.com/betterleaks/betterleaks/v2/internal/gitobj"
+	"github.com/go-git/go-billy/v5"
+	git "github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
+	format "github.com/go-git/go-git/v5/plumbing/format/config"
+	"github.com/go-git/go-git/v5/plumbing/format/idxfile"
+	"github.com/go-git/go-git/v5/plumbing/format/packfile"
+	"github.com/go-git/go-git/v5/storage/filesystem"
 	"github.com/stretchr/testify/require"
 )
 
@@ -40,7 +40,7 @@ func newTestPack(f format.ObjectFormat) *testPack {
 	return &testPack{format: f, data: []byte{'P', 'A', 'C', 'K', 0, 0, 0, 2, 0, 0, 0, 0}}
 }
 
-func packHeader(typ plumbing.ObjectType, size uint64) []byte {
+func packHeader(typ gitobj.ObjectType, size uint64) []byte {
 	b := byte(typ)<<4 | byte(size&15)
 	size >>= 4
 	var out []byte
@@ -51,12 +51,12 @@ func packHeader(typ plumbing.ObjectType, size uint64) []byte {
 	return append(out, b)
 }
 
-func (p *testPack) add(t testing.TB, typ plumbing.ObjectType, body string, declared uint64, baseOffset int64, baseID plumbing.Hash) int64 {
+func (p *testPack) add(t testing.TB, typ gitobj.ObjectType, body string, declared uint64, baseOffset int64, baseID gitobj.Hash) int64 {
 	t.Helper()
 	offset := int64(len(p.data))
 	p.data = append(p.data, packHeader(typ, declared)...)
 	switch typ {
-	case plumbing.OFSDeltaObject:
+	case gitobj.OFSDeltaObject:
 		n := uint64(offset - baseOffset)
 		encoded := []byte{byte(n & 127)}
 		for n >>= 7; n != 0; n >>= 7 {
@@ -64,7 +64,7 @@ func (p *testPack) add(t testing.TB, typ plumbing.ObjectType, body string, decla
 			encoded = append([]byte{byte(n&127) | 128}, encoded...)
 		}
 		p.data = append(p.data, encoded...)
-	case plumbing.REFDeltaObject:
+	case gitobj.REFDeltaObject:
 		p.data = append(p.data, baseID.Bytes()...)
 	}
 	var compressed bytes.Buffer
@@ -80,14 +80,14 @@ func (p *testPack) add(t testing.TB, typ plumbing.ObjectType, body string, decla
 func (p *testPack) finish(t testing.TB) []byte {
 	t.Helper()
 	binary.BigEndian.PutUint32(p.data[8:12], p.count)
-	h, err := githash.FromObjectFormat(p.format)
+	h, err := gitobj.NewChecksum(p.format)
 	require.NoError(t, err)
 	h.Write(p.data)
 	return append(append([]byte{}, p.data...), h.Sum(nil)...)
 }
 
-func blobID(f format.ObjectFormat, text string) plumbing.Hash {
-	h := plumbing.NewHasher(f, plumbing.BlobObject, int64(len(text)))
+func blobID(f format.ObjectFormat, text string) gitobj.Hash {
+	h := gitobj.NewHasher(f, gitobj.BlobObject, int64(len(text)))
 	h.Write([]byte(text))
 	return h.Sum()
 }
@@ -108,17 +108,17 @@ func literalDelta(base, target string) string {
 // in one pack: a -> {ab -> abc -> {abcd, abcx}, ae}.
 func mixedTestPack(t testing.TB, f format.ObjectFormat) []byte {
 	p := newTestPack(f)
-	a := p.add(t, plumbing.BlobObject, "a", 1, 0, plumbing.Hash{})
+	a := p.add(t, gitobj.BlobObject, "a", 1, 0, gitobj.Hash{})
 	d := literalDelta("ab", "abc")
-	c := p.add(t, plumbing.REFDeltaObject, d, uint64(len(d)), 0, blobID(f, "ab"))
+	c := p.add(t, gitobj.REFDeltaObject, d, uint64(len(d)), 0, blobID(f, "ab"))
 	d = literalDelta("a", "ab")
-	p.add(t, plumbing.OFSDeltaObject, d, uint64(len(d)), a, plumbing.Hash{})
+	p.add(t, gitobj.OFSDeltaObject, d, uint64(len(d)), a, gitobj.Hash{})
 	d = literalDelta("abc", "abcd")
-	p.add(t, plumbing.OFSDeltaObject, d, uint64(len(d)), c, plumbing.Hash{})
+	p.add(t, gitobj.OFSDeltaObject, d, uint64(len(d)), c, gitobj.Hash{})
 	d = literalDelta("abc", "abcx")
-	p.add(t, plumbing.OFSDeltaObject, d, uint64(len(d)), c, plumbing.Hash{})
+	p.add(t, gitobj.OFSDeltaObject, d, uint64(len(d)), c, gitobj.Hash{})
 	d = literalDelta("a", "ae")
-	p.add(t, plumbing.REFDeltaObject, d, uint64(len(d)), 0, blobID(f, "a"))
+	p.add(t, gitobj.REFDeltaObject, d, uint64(len(d)), 0, blobID(f, "a"))
 	return p.finish(t)
 }
 
@@ -170,36 +170,36 @@ func TestIndexPackRejectsCorruptionAndLimits(t *testing.T) {
 	badChecksum[len(badChecksum)-1] ^= 1
 	makeBlob := func(body string, declared uint64) []byte {
 		p := newTestPack(format.SHA1)
-		p.add(t, plumbing.BlobObject, body, declared, 0, plumbing.Hash{})
+		p.add(t, gitobj.BlobObject, body, declared, 0, gitobj.Hash{})
 		return p.finish(t)
 	}
 	missing := newTestPack(format.SHA1)
 	delta := literalDelta("absent", "new")
-	missing.add(t, plumbing.REFDeltaObject, delta, uint64(len(delta)), 0, blobID(format.SHA1, "absent"))
+	missing.add(t, gitobj.REFDeltaObject, delta, uint64(len(delta)), 0, blobID(format.SHA1, "absent"))
 	duplicate := newTestPack(format.SHA1)
-	duplicate.add(t, plumbing.BlobObject, "a", 1, 0, plumbing.Hash{})
-	duplicate.add(t, plumbing.BlobObject, "a", 1, 0, plumbing.Hash{})
+	duplicate.add(t, gitobj.BlobObject, "a", 1, 0, gitobj.Hash{})
+	duplicate.add(t, gitobj.BlobObject, "a", 1, 0, gitobj.Hash{})
 	badBase := newTestPack(format.SHA1)
-	badBase.add(t, plumbing.BlobObject, "a", 1, 0, plumbing.Hash{})
-	badBase.add(t, plumbing.OFSDeltaObject, literalDelta("a", "b"), 4, 13, plumbing.Hash{})
+	badBase.add(t, gitobj.BlobObject, "a", 1, 0, gitobj.Hash{})
+	badBase.add(t, gitobj.OFSDeltaObject, literalDelta("a", "b"), 4, 13, gitobj.Hash{})
 	oversizedResult := newTestPack(format.SHA1)
-	base := oversizedResult.add(t, plumbing.BlobObject, "a", 1, 0, plumbing.Hash{})
+	base := oversizedResult.add(t, gitobj.BlobObject, "a", 1, 0, gitobj.Hash{})
 	oversized := binary.AppendUvarint([]byte{1}, 1<<40)
-	oversizedResult.add(t, plumbing.OFSDeltaObject, string(oversized), uint64(len(oversized)), base, plumbing.Hash{})
+	oversizedResult.add(t, gitobj.OFSDeltaObject, string(oversized), uint64(len(oversized)), base, gitobj.Hash{})
 	invalidDelta := newTestPack(format.SHA1)
-	base = invalidDelta.add(t, plumbing.BlobObject, "a", 1, 0, plumbing.Hash{})
-	invalidDelta.add(t, plumbing.OFSDeltaObject, "\x01\x01\x00", 3, base, plumbing.Hash{})
+	base = invalidDelta.add(t, gitobj.BlobObject, "a", 1, 0, gitobj.Hash{})
+	invalidDelta.add(t, gitobj.OFSDeltaObject, "\x01\x01\x00", 3, base, gitobj.Hash{})
 	// A plain blob is only streamed, so a huge declared size allocates nothing;
 	// the missing content fails inflation.
 	oversizedHeader := newTestPack(format.SHA1)
-	oversizedHeader.data = append(oversizedHeader.data, packHeader(plumbing.BlobObject, 1<<40)...)
+	oversizedHeader.data = append(oversizedHeader.data, packHeader(gitobj.BlobObject, 1<<40)...)
 	oversizedHeader.count = 1
 	tooMany := newTestPack(format.SHA1)
 	tooMany.count = ^uint32(0)
 	// The base must be held to apply its delta: one copy of all six bytes.
 	largeBase := newTestPack(format.SHA1)
-	base = largeBase.add(t, plumbing.BlobObject, "abcdef", 6, 0, plumbing.Hash{})
-	largeBase.add(t, plumbing.OFSDeltaObject, "\x06\x06\x90\x06", 4, base, plumbing.Hash{})
+	base = largeBase.add(t, gitobj.BlobObject, "abcdef", 6, 0, gitobj.Hash{})
+	largeBase.add(t, gitobj.OFSDeltaObject, "\x06\x06\x90\x06", 4, base, gitobj.Hash{})
 	for _, tc := range []struct {
 		name   string
 		data   []byte
@@ -260,7 +260,7 @@ func TestResolverReleasesFinishedChains(t *testing.T) {
 // object of any size is only streamed through the hasher.
 func TestIndexPackStreamsLargePlainObjects(t *testing.T) {
 	p := newTestPack(format.SHA1)
-	p.add(t, plumbing.BlobObject, "abcdef", 6, 0, plumbing.Hash{})
+	p.add(t, gitobj.BlobObject, "abcdef", 6, 0, gitobj.Hash{})
 	data := p.finish(t)
 	limits := fetchPackLimits()
 	limits.objectBytes = 2
@@ -308,7 +308,7 @@ func (r cancelPackRead) ReadAt(p []byte, off int64) (int, error) {
 
 func TestIndexPackCancellation(t *testing.T) {
 	p := newTestPack(format.SHA1)
-	p.add(t, plumbing.BlobObject, strings.Repeat("x", 4<<20), 4<<20, 0, plumbing.Hash{})
+	p.add(t, gitobj.BlobObject, strings.Repeat("x", 4<<20), 4<<20, 0, gitobj.Hash{})
 	data := p.finish(t)
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -351,7 +351,7 @@ func TestPackWriterPublishesAndCleansUp(t *testing.T) {
 			}
 			if mode == "cancel-inflate" {
 				p := newTestPack(format.SHA1)
-				p.add(t, plumbing.BlobObject, strings.Repeat("x", 4<<20), 4<<20, 0, plumbing.Hash{})
+				p.add(t, gitobj.BlobObject, strings.Repeat("x", 4<<20), 4<<20, 0, gitobj.Hash{})
 				input = p.finish(t)
 				s.ctx = newPackCancelContext(ctx, cancel, 30)
 			}
@@ -392,7 +392,7 @@ func TestPackWriterPublishesAndCleansUp(t *testing.T) {
 			case "success":
 				require.Len(t, entries, 3)
 				for _, name := range []string{"a", "ab", "abc", "abcd", "abcx", "ae"} {
-					require.NoError(t, s.HasEncodedObject(blobID(format.SHA1, name)))
+					require.NoError(t, s.HasEncodedObject(plumbing.NewHash(blobID(format.SHA1, name).String())))
 				}
 			case "existing-index":
 				require.Len(t, entries, 1, "new pack must be rolled back")
@@ -445,10 +445,10 @@ func FuzzIndexPack(f *testing.F) {
 // openBenchPack maps an existing pack the way a fetch does before resolving it.
 func openBenchPack(tb testing.TB, path string) (billy.File, int64) {
 	tb.Helper()
-	f, err := osfs.New(filepath.Dir(path), osfs.WithMmap()).Open(filepath.Base(path))
+	f, err := gitfs.New(filepath.Dir(path), gitfs.WithMmap()).Open(filepath.Base(path))
 	require.NoError(tb, err)
 	tb.Cleanup(func() { f.Close() })
-	info, err := f.Stat()
+	info, err := f.(interface{ Stat() (os.FileInfo, error) }).Stat()
 	require.NoError(tb, err)
 	return f, info.Size()
 }
@@ -489,14 +489,14 @@ func BenchmarkIndexPack(b *testing.B) {
 			_, err := f.Seek(0, io.SeekStart)
 			require.NoError(b, err)
 			w := new(idxfile.Writer)
-			parser := packfile.NewParser(f, packfile.WithScannerObservers(w))
+			parser, err := packfile.NewParser(packfile.NewScanner(f), w)
+			require.NoError(b, err)
 			_, err = parser.Parse()
 			require.NoError(b, err)
 			idx, err := w.Index()
 			require.NoError(b, err)
-			h, err := githash.FromObjectFormat(format.SHA1)
+			_, err = idxfile.NewEncoder(io.Discard).Encode(idx)
 			require.NoError(b, err)
-			require.NoError(b, idxfile.Encode(io.Discard, h, idx))
 		} else {
 			_, err := indexPack(b.Context(), f, size, format.SHA1, fetchPackLimits(), io.Discard, nil)
 			require.NoError(b, err)

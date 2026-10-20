@@ -8,13 +8,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/betterleaks/betterleaks/v2/internal/gitobj"
 	"github.com/betterleaks/betterleaks/v2/sources"
 	"github.com/betterleaks/betterleaks/v2/sources/scm"
-	git "github.com/go-git/go-git/v6"
-	"github.com/go-git/go-git/v6/plumbing"
-	"github.com/go-git/go-git/v6/plumbing/filemode"
-	"github.com/go-git/go-git/v6/plumbing/object"
-	"github.com/go-git/go-git/v6/plumbing/storer"
+	"github.com/go-git/go-git/v5/plumbing/filemode"
 )
 
 // Notes are ordinary commits and trees under refs/notes/*. Scan each changed
@@ -22,7 +19,7 @@ import (
 // the note edit; git.note_target identifies the annotated object, not its author.
 //
 //nolint:exhaustruct // Cache bookkeeping starts empty.
-func (s *Source) notes(ctx context.Context, r *git.Repository, yield sources.FragmentsFunc) error {
+func (s *Source) notes(ctx context.Context, r *repository, yield sources.FragmentsFunc) error {
 	refs, err := r.Storer.IterReferences()
 	if err != nil {
 		return err
@@ -46,7 +43,7 @@ func (s *Source) notes(ctx context.Context, r *git.Repository, yield sources.Fra
 			continue
 		}
 		name := ref.Name()
-		if ref, err = storer.ResolveReference(r.Storer, name); err != nil {
+		if ref, err = gitobj.ResolveReference(r.Storer, name); err != nil {
 			return fmt.Errorf("notes ref %s: %w", name, err)
 		}
 		walk := newWalk(r)
@@ -72,8 +69,8 @@ func (s *Source) notes(ctx context.Context, r *git.Repository, yield sources.Fra
 	}
 }
 
-func (s *Source) noteVersion(ctx context.Context, store *objectStorage, trees *treeCache, ref string, commit *object.Commit, yield sources.FragmentsFunc) error {
-	var parent plumbing.Hash
+func (s *Source) noteVersion(ctx context.Context, store *objectStorage, trees *treeCache, ref string, commit *gitobj.Commit, yield sources.FragmentsFunc) error {
+	var parent gitobj.Hash
 	if parents := store.parents(commit); len(parents) > 0 {
 		parent = parents[0]
 	}
@@ -94,7 +91,7 @@ func (s *Source) noteVersion(ctx context.Context, store *objectStorage, trees *t
 		attrs[sources.AttrResource] = sources.ResourceGitNote
 		attrs[sources.AttrGitNotesRef], attrs[sources.AttrGitBlobSHA] = ref, id.String()
 		target := strings.ReplaceAll(change.To.Name, "/", "")
-		if len(target) == id.Size()*2 && plumbing.IsHash(target) {
+		if len(target) == id.Size()*2 && gitobj.IsHash(target) {
 			attrs[sources.AttrGitNoteTarget] = target
 		}
 		if s.Prefilter != nil && s.Prefilter(attrs) {
@@ -108,8 +105,8 @@ func (s *Source) noteVersion(ctx context.Context, store *objectStorage, trees *t
 		if err != nil {
 			return err
 		}
-		if obj.kind != plumbing.BlobObject {
-			return plumbing.ErrObjectNotFound
+		if obj.kind != gitobj.BlobObject {
+			return gitobj.ErrObjectNotFound
 		}
 		if err := yield(sources.Fragment{Raw: obj.raw, StartLine: 1, Attributes: attrs}, nil); err != nil {
 			return err
@@ -122,7 +119,7 @@ func (s *Source) noteVersion(ctx context.Context, store *objectStorage, trees *t
 // only the outer annotation has a tag ref suitable for generating a web link.
 // Keep each ref occurrence: prefilters and finding attribution depend on the
 // source ref, even when several refs share the same annotation object.
-func (s *Source) tagMessages(ctx context.Context, r *git.Repository, yield sources.FragmentsFunc) error {
+func (s *Source) tagMessages(ctx context.Context, r *repository, yield sources.FragmentsFunc) error {
 	refs, err := r.Tags()
 	if err != nil {
 		return err
@@ -139,7 +136,7 @@ func (s *Source) tagMessages(ctx context.Context, r *git.Repository, yield sourc
 		if err != nil {
 			return err
 		}
-		ref, err = storer.ResolveReference(r.Storer, ref.Name())
+		ref, err = gitobj.ResolveReference(r.Storer, ref.Name())
 		if err != nil {
 			return err
 		}
@@ -151,14 +148,14 @@ func (s *Source) tagMessages(ctx context.Context, r *git.Repository, yield sourc
 			if depth == maxTagNesting {
 				return fmt.Errorf("annotated tag nesting exceeds %d levels", maxTagNesting)
 			}
-			obj, err := r.Storer.EncodedObject(plumbing.AnyObject, id)
+			obj, err := r.Storer.EncodedObject(gitobj.AnyObject, id)
 			if err != nil {
 				return fmt.Errorf("tag ref %s: %w", ref.Name(), err)
 			}
-			if obj.Type() != plumbing.TagObject {
+			if obj.Type() != gitobj.TagObject {
 				break
 			}
-			tag, err := object.DecodeTag(r.Storer, obj)
+			tag, err := gitobj.DecodeTag(r.Storer, obj)
 			if err != nil {
 				return err
 			}
@@ -184,7 +181,7 @@ func (s *Source) tagMessages(ctx context.Context, r *git.Repository, yield sourc
 					return err
 				}
 			}
-			if tag.TargetType != plumbing.TagObject {
+			if tag.TargetType != gitobj.TagObject {
 				break
 			}
 			id = tag.Target
@@ -195,7 +192,7 @@ func (s *Source) tagMessages(ctx context.Context, r *git.Repository, yield sourc
 // resolveRemote reads only local configuration. Match Git's default fetch
 // remote: the current branch's remote, otherwise the sole remote or origin.
 // Link metadata is optional and must not prevent a history scan.
-func (s *Source) resolveRemote(r *git.Repository) (scm.Platform, string) {
+func (s *Source) resolveRemote(r *repository) (scm.Platform, string) {
 	if s.Platform == scm.NoPlatform || s.RemoteURL != "" {
 		return scm.ResolveRemoteURL(s.Platform, s.RemoteURL)
 	}
@@ -209,7 +206,7 @@ func (s *Source) resolveRemote(r *git.Repository) (scm.Platform, string) {
 			name = n
 		}
 	}
-	if head, err := r.Storer.Reference(plumbing.HEAD); err == nil && head.Type() == plumbing.SymbolicReference && head.Target().IsBranch() {
+	if head, err := r.Storer.Reference(gitobj.HEAD); err == nil && head.Type() == gitobj.SymbolicReference && head.Target().IsBranch() {
 		if branch := cfg.Branches[head.Target().Short()]; branch != nil && branch.Remote != "" {
 			name = branch.Remote
 		}

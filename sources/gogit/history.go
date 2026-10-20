@@ -8,10 +8,7 @@ import (
 	"io"
 	"strings"
 
-	git "github.com/go-git/go-git/v6"
-	"github.com/go-git/go-git/v6/plumbing"
-	"github.com/go-git/go-git/v6/plumbing/object"
-	"github.com/go-git/go-git/v6/plumbing/storer"
+	"github.com/betterleaks/betterleaks/v2/internal/gitobj"
 )
 
 // history walks commits newest first by committer time from a set of roots,
@@ -21,15 +18,15 @@ import (
 // IDs and timestamps instead. Decoded commits (and their retained pack readers)
 // live only while a worker needs them.
 type history struct {
-	r        *git.Repository
+	r        *repository
 	store    *objectStorage
-	seen     map[plumbing.Hash]struct{}
+	seen     map[gitobj.Hash]struct{}
 	frontier commitHeap
 	sequence uint64
 }
 
 type commitPosition struct {
-	id       plumbing.Hash
+	id       gitobj.Hash
 	when     int64
 	sequence uint64
 }
@@ -52,13 +49,13 @@ func (h *commitHeap) Pop() any {
 }
 
 //nolint:exhaustruct // An empty frontier and sequence start at zero.
-func newWalk(r *git.Repository) *history {
-	return &history{r: r, store: r.Storer.(*objectStorage), seen: make(map[plumbing.Hash]struct{})}
+func newWalk(r *repository) *history {
+	return &history{r: r, store: r.Storer.(*objectStorage), seen: make(map[gitobj.Hash]struct{})}
 }
 
 // history starts at Revision when set, otherwise at HEAD and every ref except
 // notes. A range A..B starts at B and excludes everything reachable from A.
-func (s *Source) history(ctx context.Context, r *git.Repository) (*history, error) {
+func (s *Source) history(ctx context.Context, r *repository) (*history, error) {
 	h := newWalk(r)
 	if s.Revision == "" {
 		return h, h.refs(ctx)
@@ -71,7 +68,7 @@ func (s *Source) history(ctx context.Context, r *git.Repository) (*history, erro
 		if to == "" {
 			to = "HEAD"
 		}
-		id, err := r.ResolveRevision(plumbing.Revision(from))
+		id, err := r.ResolveRevision(gitobj.Revision(from))
 		if err != nil {
 			return nil, fmt.Errorf("resolve revision %q: %w", from, err)
 		}
@@ -80,7 +77,7 @@ func (s *Source) history(ctx context.Context, r *git.Repository) (*history, erro
 		}
 		revision = to
 	}
-	id, err := r.ResolveRevision(plumbing.Revision(revision))
+	id, err := r.ResolveRevision(gitobj.Revision(revision))
 	if err != nil {
 		return nil, fmt.Errorf("resolve revision %q: %w", revision, err)
 	}
@@ -93,7 +90,7 @@ func (h *history) refs(ctx context.Context) error {
 		if err = h.tip(ctx, head.Hash()); err != nil {
 			return err
 		}
-	} else if !errors.Is(err, plumbing.ErrReferenceNotFound) {
+	} else if !errors.Is(err, gitobj.ErrReferenceNotFound) {
 		return err
 	}
 	refs, err := h.r.Storer.IterReferences()
@@ -117,11 +114,11 @@ func (h *history) refs(ctx context.Context) error {
 		}
 		// IterReferences can include symbolic remote HEADs. Resolve them rather than
 		// interpreting their zero hash as an object ID.
-		if ref.Type() == plumbing.SymbolicReference {
+		if ref.Type() == gitobj.SymbolicReference {
 			name := ref.Name()
-			ref, err = storer.ResolveReference(h.r.Storer, name)
+			ref, err = gitobj.ResolveReference(h.r.Storer, name)
 			if err != nil {
-				if name == plumbing.HEAD && errors.Is(err, plumbing.ErrReferenceNotFound) {
+				if name == gitobj.HEAD && errors.Is(err, gitobj.ErrReferenceNotFound) {
 					continue // Unborn HEAD; there may still be notes or loose blobs.
 				}
 				return fmt.Errorf("resolve ref %s: %w", name, err)
@@ -135,7 +132,7 @@ func (h *history) refs(ctx context.Context) error {
 
 // tip adds a root. Annotated tags are peeled; tags naming trees or blobs have no
 // commit ancestry and add nothing.
-func (h *history) tip(ctx context.Context, id plumbing.Hash) error {
+func (h *history) tip(ctx context.Context, id gitobj.Hash) error {
 	c, err := h.peel(ctx, id)
 	if err != nil || c == nil {
 		return err
@@ -148,12 +145,12 @@ func (h *history) tip(ctx context.Context, id plumbing.Hash) error {
 
 // exclude marks everything reachable from id as visited, so the walk never
 // reaches it.
-func (h *history) exclude(ctx context.Context, id plumbing.Hash) error {
+func (h *history) exclude(ctx context.Context, id gitobj.Hash) error {
 	c, err := h.peel(ctx, id)
 	if err != nil || c == nil {
 		return err
 	}
-	pending := []plumbing.Hash{c.Hash}
+	pending := []gitobj.Hash{c.Hash}
 	for len(pending) > 0 {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -173,25 +170,25 @@ func (h *history) exclude(ctx context.Context, id plumbing.Hash) error {
 	return nil
 }
 
-func (h *history) peel(ctx context.Context, id plumbing.Hash) (*object.Commit, error) {
+func (h *history) peel(ctx context.Context, id gitobj.Hash) (*gitobj.Commit, error) {
 	for range maxTagNesting {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		obj, err := h.r.Storer.EncodedObject(plumbing.AnyObject, id)
+		obj, err := h.r.Storer.EncodedObject(gitobj.AnyObject, id)
 		if err != nil {
 			return nil, fmt.Errorf("read history tip %s: %w", id, err)
 		}
 		switch obj.Type() {
-		case plumbing.CommitObject:
-			return object.DecodeCommit(h.r.Storer, obj)
-		case plumbing.TagObject:
-			tag, err := object.DecodeTag(h.r.Storer, obj)
+		case gitobj.CommitObject:
+			return gitobj.DecodeCommit(h.r.Storer, obj)
+		case gitobj.TagObject:
+			tag, err := gitobj.DecodeTag(h.r.Storer, obj)
 			if err != nil {
 				return nil, err
 			}
 			id = tag.Target
-		case plumbing.BlobObject, plumbing.TreeObject:
+		case gitobj.BlobObject, gitobj.TreeObject:
 			return nil, nil
 		default:
 			return nil, fmt.Errorf("invalid history tip type %s", obj.Type())
@@ -200,13 +197,13 @@ func (h *history) peel(ctx context.Context, id plumbing.Hash) (*object.Commit, e
 	return nil, fmt.Errorf("annotated tag nesting exceeds %d levels", maxTagNesting)
 }
 
-func (h *history) enqueue(c *object.Commit) {
+func (h *history) enqueue(c *gitobj.Commit) {
 	h.seen[c.Hash] = struct{}{}
 	heap.Push(&h.frontier, commitPosition{c.Hash, c.Committer.When.Unix(), h.sequence})
 	h.sequence++
 }
 
-func (h *history) next(ctx context.Context) (*object.Commit, error) {
+func (h *history) next(ctx context.Context) (*gitobj.Commit, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}

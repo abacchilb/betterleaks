@@ -12,9 +12,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/betterleaks/betterleaks/v2/internal/gitobj"
 	"github.com/betterleaks/betterleaks/v2/sources"
 	"github.com/betterleaks/betterleaks/v2/sources/scm"
-	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/stretchr/testify/require"
 )
 
@@ -54,7 +54,7 @@ func TestRemotePackScanParity(t *testing.T) {
 		t.Fatal("an unavailable revision must fail before scanning")
 		return nil
 	})
-	require.ErrorIs(t, err, plumbing.ErrReferenceNotFound)
+	require.ErrorIs(t, err, gitobj.ErrReferenceNotFound)
 	require.ErrorContains(t, err, "--clone-ref=refs/...")
 	require.NoError(t, scm.CloneToTempDir(t.Context(), remote, "", "", scm.CloneOptions{}, func(path string) error {
 		r, cleanup, err := (&Source{RepoPath: path}).open(t.Context())

@@ -20,12 +20,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/betterleaks/betterleaks/v2/internal/gitobj"
 	"github.com/betterleaks/betterleaks/v2/sources"
-	git "github.com/go-git/go-git/v6"
-	"github.com/go-git/go-git/v6/plumbing"
-	"github.com/go-git/go-git/v6/plumbing/filemode"
-	"github.com/go-git/go-git/v6/plumbing/object"
-	"github.com/go-git/go-git/v6/storage/memory"
+	"github.com/go-git/go-git/v5/plumbing/filemode"
 	"github.com/stretchr/testify/require"
 )
 
@@ -724,26 +721,29 @@ func TestObjectScanCancellationAndLinks(t *testing.T) {
 func TestTreeExpansionBudget(t *testing.T) {
 	for _, empty := range []bool{false, true} {
 		t.Run(fmt.Sprintf("empty=%v", empty), func(t *testing.T) {
-			store := memory.NewStorage()
-			repo, err := git.Init(store, nil)
-			require.NoError(t, err)
-			var tree object.Tree
+			path := initRepo(t)
+			var tree gitobj.Tree
 			if !empty {
-				blob := store.NewEncodedObject()
-				blob.SetType(plumbing.BlobObject)
-				id, err := store.SetEncodedObject(blob)
-				require.NoError(t, err)
-				tree.Entries = []object.TreeEntry{{Name: "secret", Mode: filemode.Regular, Hash: id}}
+				id := gitobj.NewHash(gitInput(t, path, nil, "hash-object", "-w", "--stdin"))
+				tree.Entries = []gitobj.TreeEntry{{Name: "secret", Mode: filemode.Regular, Hash: id}}
 			}
-			var id plumbing.Hash
+			var id gitobj.Hash
 			for range 21 {
-				encoded := store.NewEncodedObject()
+				encoded := gitobj.NewMemoryObject(gitobj.ZeroHash)
 				require.NoError(t, tree.Encode(encoded))
-				id, err = store.SetEncodedObject(encoded)
+				reader, err := encoded.Reader()
 				require.NoError(t, err)
-				tree.Entries = []object.TreeEntry{{Name: "a", Mode: filemode.Dir, Hash: id}, {Name: "b", Mode: filemode.Dir, Hash: id}}
+				raw, err := io.ReadAll(reader)
+				require.NoError(t, err)
+				reader.Close()
+				id = gitobj.NewHash(gitInput(t, path, raw, "hash-object", "-w", "--stdin", "-t", "tree"))
+				tree.Entries = []gitobj.TreeEntry{{Name: "a", Mode: filemode.Dir, Hash: id}, {Name: "b", Mode: filemode.Dir, Hash: id}}
 			}
-			changes, err := rawTreeChanges(t.Context(), &treeCache{r: repo}, &object.Commit{TreeHash: id}, plumbing.ZeroHash)
+			repo, cleanup, err := (&Source{RepoPath: path}).open(t.Context())
+			require.NoError(t, err)
+			defer cleanup()
+
+			changes, err := rawTreeChanges(t.Context(), &treeCache{r: repo}, &gitobj.Commit{TreeHash: id}, gitobj.ZeroHash)
 			require.True(t, isLimit(err), "%v", err)
 			require.Empty(t, changes, "an incomplete comparison must not yield partial patches")
 		})
