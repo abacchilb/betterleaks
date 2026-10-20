@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"maps"
 	"net/http"
@@ -226,6 +227,44 @@ func TestCloneRequiresEmptyDestination(t *testing.T) {
 	err := CloneAuthed(t.Context(), server.URL+"/repo", "", dest, CloneOptions{})
 	require.ErrorContains(t, err, "not empty")
 	require.Zero(t, requests.Load(), "a rejected destination must not reach the network")
+}
+
+func TestCloneRejectsMissingPack(t *testing.T) {
+	id := strings.Repeat("1", 40)
+	packet := func(s string) string { return fmt.Sprintf("%04x%s", len(s)+4, s) }
+	advertisement := packet("# service=git-upload-pack\n") + "0000" +
+		packet(id+" HEAD\x00ofs-delta no-progress symref=HEAD:refs/heads/main\n") +
+		packet(id+" refs/heads/main\n") + "0000"
+	for _, body := range []string{"", "0008NAK\n", "0008NAK\nPACK"} {
+		t.Run(fmt.Sprintf("response-bytes=%d", len(body)), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodGet {
+					w.Header().Set("Content-Type", "application/x-git-upload-pack-advertisement")
+					fmt.Fprint(w, advertisement)
+				} else {
+					w.Header().Set("Content-Type", "application/x-git-upload-pack-result")
+					fmt.Fprint(w, body)
+				}
+			}))
+			defer server.Close()
+			dest := filepath.Join(t.TempDir(), "clone")
+			require.Error(t, CloneAuthed(t.Context(), server.URL+"/repo.git", "", dest, CloneOptions{}))
+			repo, err := git.PlainOpen(dest)
+			require.NoError(t, err)
+			defer repo.Storer.(*filesystem.Storage).Close()
+			refs, err := repo.References()
+			require.NoError(t, err)
+			require.NoError(t, refs.ForEach(func(ref *plumbing.Reference) error {
+				require.NotEqual(t, plumbing.HashReference, ref.Type(), "failed fetch must not publish advertised refs")
+				return nil
+			}))
+			packs, err := os.ReadDir(filepath.Join(dest, "objects", "pack"))
+			if !errors.Is(err, os.ErrNotExist) {
+				require.NoError(t, err)
+				require.Empty(t, packs, "failed fetch must remove its temporary pack")
+			}
+		})
+	}
 }
 
 // Hosts such as GitHub accept HTTP/2 when a client offers it. The clone client

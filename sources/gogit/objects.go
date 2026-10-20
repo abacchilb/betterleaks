@@ -1,14 +1,20 @@
 package gogit
 
 import (
+	"bufio"
+	"compress/zlib"
 	"context"
 	"errors"
 	"io"
+	"math"
+	"os"
 	"strings"
 	"sync"
 
 	"github.com/betterleaks/betterleaks/v2/internal/gitobj"
+	"github.com/betterleaks/betterleaks/v2/internal/gitpack"
 	"github.com/go-git/go-git/v5/config"
+	"github.com/go-git/go-git/v5/plumbing"
 )
 
 // objectStorage reads immutable repository objects through the scanner's
@@ -41,6 +47,88 @@ func (s *objectStorage) EncodedObject(kind gitobj.ObjectType, id gitobj.Hash) (g
 		return nil, gitobj.ErrObjectNotFound
 	}
 	return o, nil
+}
+
+// ObjectType follows pack delta bases using only record headers. Revision
+// disambiguation must not decompress unrelated blobs or apply their size limit
+// just to decide whether they can name a commit.
+func (s *objectStorage) ObjectType(id gitobj.Hash) (gitobj.ObjectType, error) {
+	if err := s.ctx.Err(); err != nil {
+		return gitobj.AnyObject, err
+	}
+	if cached := s.cached(id); cached != nil {
+		return cached.Type(), nil
+	}
+	pack, offset, err := s.locate(id)
+	if err != nil {
+		return gitobj.AnyObject, err
+	}
+	input := packInflaters.Get().(*packInflater)
+	defer func() { input.input.Reset(nil); packInflaters.Put(input) }()
+	for range maxDeltaChain + 1 {
+		if err := s.ctx.Err(); err != nil {
+			return gitobj.AnyObject, err
+		}
+		if pack == nil {
+			return s.looseObjectType(id)
+		}
+		if offset < 12 || offset >= pack.end {
+			return gitobj.AnyObject, errors.New("git pack offset out of bounds")
+		}
+		input.input.Reset(io.NewSectionReader(pack.file, offset, pack.end-offset))
+		header, err := gitpack.ReadHeader(input.input, offset, pack.hashSize, math.MaxInt64)
+		if err != nil {
+			return gitobj.AnyObject, err
+		}
+		switch header.Type {
+		case gitobj.OFSDeltaObject:
+			offset = header.BaseOffset
+		case gitobj.REFDeltaObject:
+			id = header.BaseID
+			pack, offset, err = s.locate(id)
+			if err != nil {
+				return gitobj.AnyObject, err
+			}
+		default:
+			return header.Type, nil
+		}
+	}
+	return gitobj.AnyObject, limitf("git object type delta chain exceeds %d", maxDeltaChain)
+}
+
+func (s *objectStorage) looseObjectType(id gitobj.Hash) (gitobj.ObjectType, error) {
+	hex := id.String()
+	for _, fs := range append([]readOnlyFS{s.fs}, s.alternates...) {
+		f, err := fs.Open("objects/" + hex[:2] + "/" + hex[2:])
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return gitobj.AnyObject, err
+		}
+		kind, err := looseObjectType(contextReader{s.ctx, f})
+		return kind, errors.Join(err, f.Close())
+	}
+	return gitobj.AnyObject, gitobj.ErrObjectNotFound
+}
+
+func looseObjectType(r io.Reader) (gitobj.ObjectType, error) {
+	z, err := zlib.NewReader(r)
+	if err != nil {
+		return gitobj.AnyObject, err
+	}
+	defer z.Close()
+	// The longest valid type, "commit", is followed by a space. Do not read
+	// the object's body or allocate according to its declared size.
+	name, err := bufio.NewReader(io.LimitReader(z, 8)).ReadString(' ')
+	if err != nil {
+		return gitobj.AnyObject, err
+	}
+	kind, err := plumbing.ParseObjectType(strings.TrimSuffix(name, " "))
+	if err != nil || kind.IsDelta() || kind == gitobj.AnyObject {
+		return gitobj.AnyObject, errors.Join(err, errors.New("invalid loose Git object type"))
+	}
+	return kind, nil
 }
 
 // parents returns a commit's parents. Like Git, shallow boundary commits are

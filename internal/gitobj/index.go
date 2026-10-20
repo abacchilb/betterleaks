@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -314,4 +315,63 @@ func (i *Index) HashesWithPrefix(prefix []byte) ([]Hash, error) {
 		}
 	}
 	return ids, nil
+}
+
+// ForEachHashWithPrefix visits matching IDs without allocating a result set.
+// prefix is hexadecimal and may end in a half-byte. Returning false stops the
+// walk, allowing revision lookup to stop as soon as ambiguity is established.
+func (i *Index) ForEachHashWithPrefix(prefix string, yield func(Hash) bool) error {
+	if err := i.ctx.Err(); err != nil {
+		return err
+	}
+	if len(prefix) == 0 || len(prefix) > i.id.Size()*2 {
+		return errors.New("invalid git hash prefix length")
+	}
+	whole, odd := len(prefix)/2, len(prefix)%2 != 0
+	if odd {
+		prefix += "0"
+	}
+	first := Hash{sha256: i.id.sha256}
+	if _, err := hex.Decode(first.data[:], []byte(prefix)); err != nil {
+		return err
+	}
+	low, high := first.data[0], first.data[0]
+	if whole == 0 {
+		high |= 0x0f
+	}
+	lo, hi := uint32(0), i.fanout[high]
+	if low > 0 {
+		lo = i.fanout[low-1]
+	}
+	// The index is sorted by object ID. Seek directly to the first possible
+	// match, including all bits of an odd-length prefix.
+	var buf [32]byte
+	end := hi
+	for lo < hi {
+		mid := lo + (hi-lo)/2
+		if _, err := i.idx.ReadAt(buf[:i.id.Size()], 1032+int64(mid)*int64(i.id.Size())); err != nil {
+			return err
+		}
+		if bytes.Compare(buf[:i.id.Size()], first.data[:i.id.Size()]) < 0 {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	for n := lo; n < end; n++ {
+		if err := i.ctx.Err(); err != nil {
+			return err
+		}
+		id, err := i.hash(n)
+		if err != nil {
+			return err
+		}
+		if !bytes.Equal(id.data[:whole], first.data[:whole]) || odd && id.data[whole]&0xf0 != first.data[whole] {
+			break
+		}
+		if !yield(id) {
+			break
+		}
+	}
+	return nil
 }

@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/betterleaks/betterleaks/v2/internal/gitobj"
+	"github.com/betterleaks/betterleaks/v2/sources"
 	"github.com/betterleaks/betterleaks/v2/sources/scm"
 	"github.com/go-git/go-billy/v5"
 	"github.com/stretchr/testify/require"
@@ -67,6 +68,30 @@ func TestReferenceDisappearsDuringEnumeration(t *testing.T) {
 	require.NotNil(t, s.refs[gitobj.HEAD])
 	require.NotNil(t, s.refs[gitobj.ReferenceName("refs/heads/"+gitFixture(t, repo, "branch", "--show-current"))])
 	require.NotContains(t, s.refs, gitobj.ReferenceName("refs/heads/removed"))
+}
+
+func TestDefaultScanIgnoresReferenceLocks(t *testing.T) {
+	for _, packed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("packed=%v", packed), func(t *testing.T) {
+			repo := initRepo(t)
+			base := commitFile(t, repo, "file", "TOKEN_PUBLISHED\n", "published")
+			unpublished := commitFile(t, repo, "file", "TOKEN_UNPUBLISHED\n", "pending update")
+			gitFixture(t, repo, "reset", "--hard", base)
+			if packed {
+				gitFixture(t, repo, "pack-refs", "--all")
+			}
+			heads := filepath.Join(repo, ".git", "refs", "heads")
+			require.NoError(t, os.MkdirAll(filepath.Join(heads, "namespace.lock"), 0700))
+			require.NoError(t, os.WriteFile(filepath.Join(heads, "namespace.lock", "pending"), []byte(unpublished+"\n"), 0600))
+			for _, value := range []string{"", "in progress", unpublished + "\n"} {
+				require.NoError(t, os.WriteFile(filepath.Join(heads, "main.lock"), []byte(value), 0600))
+				require.Equal(t, map[string]string{"TOKEN_PUBLISHED\n": "file:1"}, textOccurrences(collect(t, &Source{RepoPath: repo})))
+			}
+			// Filtering temporary files must not hide a genuinely broken ref.
+			require.NoError(t, os.WriteFile(filepath.Join(heads, "broken"), []byte("not a hash"), 0600))
+			require.Error(t, (&Source{RepoPath: repo}).Fragments(t.Context(), func(_ sources.Fragment, err error) error { return err }))
+		})
+	}
 }
 
 func TestAlternateObjectDirectories(t *testing.T) {
@@ -245,5 +270,59 @@ func TestWorktreeConfigOverlay(t *testing.T) {
 				close()
 			}
 		})
+	}
+}
+
+func TestWorktreeConfigPreservesSharedSettings(t *testing.T) {
+	for _, linked := range []bool{false, true} {
+		for _, overlay := range []string{"fetch", "url", "description"} {
+			t.Run(fmt.Sprintf("linked=%v/%s", linked, overlay), func(t *testing.T) {
+				repo := initRepo(t)
+				commitFile(t, repo, "file", "TOKEN_CONFIG\n", "initial")
+				gitFixture(t, repo, "remote", "add", "origin", "https://github.com/example/shared")
+				gitFixture(t, repo, "remote", "add", "review", "https://github.com/example/review")
+				gitFixture(t, repo, "config", "extensions.worktreeConfig", "true")
+				gitFixture(t, repo, "config", "url.https://github.com/.insteadOf", "gh:")
+				path := repo
+				if linked {
+					path = filepath.Join(t.TempDir(), "linked")
+					gitFixture(t, repo, "worktree", "add", "-qb", "linked", path)
+				}
+				branch := gitFixture(t, path, "branch", "--show-current")
+				gitFixture(t, repo, "config", "branch."+branch+".remote", "review")
+				gitFixture(t, repo, "config", "branch."+branch+".merge", "refs/heads/main")
+				want := "https://github.com/example/shared"
+				switch overlay {
+				case "fetch":
+					gitFixture(t, path, "config", "--worktree", "remote.origin.fetch", "+refs/heads/topic:refs/remotes/origin/topic")
+					gitFixture(t, path, "config", "--worktree", "--add", "remote.origin.fetch", "+refs/tags/*:refs/tags/*")
+				case "url":
+					gitFixture(t, path, "config", "--worktree", "remote.origin.url", "gh:example/worktree")
+					gitFixture(t, path, "config", "--worktree", "--add", "remote.origin.url", "gh:example/mirror")
+					want = "https://github.com/example/worktree"
+				case "description":
+					gitFixture(t, path, "config", "--worktree", "branch."+branch+".description", "worktree description")
+				}
+				s := &Source{RepoPath: path}
+				r, close, err := s.open(t.Context())
+				require.NoError(t, err)
+				defer close()
+				cfg, err := r.Config()
+				require.NoError(t, err)
+				require.NotEmpty(t, cfg.Remotes["origin"].URLs)
+				require.Equal(t, want, cfg.Remotes["origin"].URLs[0])
+				require.Equal(t, "review", cfg.Branches[branch].Remote)
+				require.Equal(t, "refs/heads/main", cfg.Branches[branch].Merge.String())
+				_, remote := s.resolveRemote(r)
+				require.Equal(t, "https://github.com/example/review", remote)
+				if overlay == "url" {
+					require.Equal(t, []string{want, "https://github.com/example/mirror"}, cfg.Remotes["origin"].URLs)
+					require.Len(t, cfg.Remotes["origin"].Fetch, 1, "overlay URL must preserve shared fetch settings")
+				}
+				if overlay == "fetch" {
+					require.Len(t, cfg.Remotes["origin"].Fetch, 2, "all values of the overriding setting must be retained")
+				}
+			})
+		}
 	}
 }

@@ -106,7 +106,7 @@ func (f objectDirectoryFS) ReadDir(name string) ([]os.FileInfo, error) {
 	return f.Filesystem.ReadDir(objectPath(name))
 }
 func alternateFS(path string) readOnlyFS {
-	return readOnlyFS{Filesystem: objectDirectoryFS{gitfs.New(path)}, objectRoot: path}
+	return readOnlyFS{Filesystem: objectDirectoryFS{gitfs.New(path)}, objectRoot: path, pool: nil}
 }
 
 func (s *objectStorage) Filesystem() billy.Filesystem    { return s.fs }
@@ -134,11 +134,11 @@ func (s *objectStorage) loadConfig() error {
 			if err != nil {
 				return err
 			}
-			// These are the worktree settings used by the read-only source:
-			// remote selection and finding links. Shared object storage keeps
-			// the common repository's format and extension requirements.
-			maps.Copy(c.Remotes, overlay.Remotes)
-			maps.Copy(c.Branches, overlay.Branches)
+			mergeWorktreeConfig(c.Raw, overlay.Raw)
+			c, err = projectRepositoryConfig(c.Raw)
+			if err != nil {
+				return err
+			}
 		}
 	}
 	format := strings.ToLower(c.Raw.Section("extensions").Option("objectformat"))
@@ -306,6 +306,58 @@ func (s *objectStorage) HashesWithPrefix(prefix []byte) ([]gitobj.Hash, error) {
 		ids = append(ids, id)
 	}
 	return ids, nil
+}
+
+// ForEachHashWithPrefix streams revision candidates. Copies in multiple packs
+// or alternate stores may be visited more than once; the resolver only needs
+// to retain one eligible candidate to detect a second distinct match.
+func (s *objectStorage) ForEachHashWithPrefix(prefix string, yield func(gitobj.Hash) bool) error {
+	stopped := false
+	visit := func(id gitobj.Hash) bool {
+		stopped = !yield(id)
+		return !stopped
+	}
+	for _, pack := range s.packs {
+		if err := pack.index.ForEachHashWithPrefix(prefix, visit); err != nil {
+			return err
+		}
+		if stopped {
+			return nil
+		}
+	}
+	var dirs []string
+	if len(prefix) == 1 {
+		for _, digit := range "0123456789abcdef" {
+			dirs = append(dirs, prefix+string(digit))
+		}
+	} else {
+		dirs = []string{prefix[:2]}
+	}
+	size := gitobj.FromObjectFormat(s.cfg.Extensions.ObjectFormat).Size() * 2
+	for _, fs := range append([]readOnlyFS{s.fs}, s.alternates...) {
+		for _, dir := range dirs {
+			if err := s.ctx.Err(); err != nil {
+				return err
+			}
+			entries, err := fs.ReadDir("objects/" + dir)
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			for _, entry := range entries {
+				if err := s.ctx.Err(); err != nil {
+					return err
+				}
+				id := dir + entry.Name()
+				if len(id) == size && strings.HasPrefix(id, prefix) && gitobj.IsHash(id) && !visit(gitobj.NewHash(id)) {
+					return nil
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func (s *objectStorage) loadRefs() error {

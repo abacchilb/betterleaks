@@ -206,7 +206,12 @@ func fetchRefs(ctx context.Context, remote, dest string, refs []config.RefSpec, 
 	if err != nil {
 		return err
 	}
-	_, copyErr := io.Copy(writer, response)
+	copied, copyErr := io.Copy(writer, response)
+	if copyErr == nil && copied == 0 {
+		// A fresh clone with nonempty wants needs a pack. A protocol ACK/NAK
+		// alone is not a successful fetch, even though the reader reaches EOF.
+		copyErr = fmt.Errorf("remote returned no pack for requested objects: %w", io.ErrUnexpectedEOF)
+	}
 	if copyErr != nil {
 		writer.(*packWriter).err = copyErr
 	}

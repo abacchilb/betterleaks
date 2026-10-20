@@ -70,7 +70,8 @@ func (s *Source) open(ctx context.Context) (*repository, func(), error) {
 	if l.common != l.gitDir {
 		common = gitfs.New(l.common)
 	}
-	fs := readOnlyFS{Filesystem: repositoryFS{Filesystem: dot, common: common}, objectRoot: l.common}
+	pool := gitfs.NewFilePool(ctx, 64)
+	fs := readOnlyFS{Filesystem: repositoryFS{Filesystem: dot, common: common}, objectRoot: l.common, pool: pool}
 	shallow, err := readShallow(fs)
 	if err != nil {
 		return nil, nil, err
@@ -85,7 +86,9 @@ func (s *Source) open(ctx context.Context) (*repository, func(), error) {
 		return nil, nil, err
 	}
 	for _, path := range objectDirs {
-		reader.alternates = append(reader.alternates, alternateFS(path))
+		alternate := alternateFS(path)
+		alternate.pool = pool
+		reader.alternates = append(reader.alternates, alternate)
 	}
 
 	if s.DiskCacheMiB > 0 {
@@ -147,12 +150,13 @@ func readLimited(fs billy.Filesystem, path string, limit int64) (string, error) 
 type readOnlyFS struct {
 	billy.Filesystem
 	objectRoot string
+	pool       *gitfs.FilePool
 }
 
 func (f readOnlyFS) Open(path string) (billy.File, error) {
 	fs := f.Filesystem
 	if strings.HasPrefix(filepath.ToSlash(path), "objects/pack/") && (strings.HasSuffix(path, ".idx") || strings.HasSuffix(path, ".rev") || strings.HasSuffix(path, ".pack")) {
-		fs = gitfs.New(f.objectRoot, gitfs.WithMmap())
+		fs = gitfs.New(f.objectRoot, gitfs.WithMmap(), gitfs.WithFilePool(f.pool))
 		if _, alternate := f.Filesystem.(objectDirectoryFS); alternate {
 			path = objectPath(path)
 		}
@@ -170,7 +174,7 @@ func (f readOnlyFS) Open(path string) (billy.File, error) {
 	return file, nil
 }
 
-// Git ignores dotfiles in ref directories (for example fixture .gitkeep files).
+// Git ignores dotfiles and unpublished lock files/directories when listing refs.
 func (f readOnlyFS) ReadDir(path string) ([]os.FileInfo, error) {
 	clean := filepath.ToSlash(filepath.Clean(path))
 	if strings.HasPrefix(clean, "objects/") && len(clean) == len("objects/00") {
@@ -207,7 +211,7 @@ func (f readOnlyFS) ReadDir(path string) ([]os.FileInfo, error) {
 	if clean == "refs" || strings.HasPrefix(clean, "refs/") {
 		visible := entries[:0]
 		for _, entry := range entries {
-			if !strings.HasPrefix(entry.Name(), ".") {
+			if !strings.HasPrefix(entry.Name(), ".") && !strings.HasSuffix(entry.Name(), ".lock") {
 				visible = append(visible, entry)
 			}
 		}
@@ -233,5 +237,5 @@ func (f readOnlyFS) Chroot(path string) (billy.Filesystem, error) {
 	if err != nil {
 		return nil, err
 	}
-	return readOnlyFS{Filesystem: fs, objectRoot: fs.Root()}, nil
+	return readOnlyFS{Filesystem: fs, objectRoot: fs.Root(), pool: f.pool}, nil
 }

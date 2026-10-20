@@ -106,6 +106,26 @@ func TestLazyIndex(t *testing.T) {
 			got, err := i.HashesWithPrefix([]byte{1})
 			require.NoError(t, err)
 			require.Equal(t, ids[:2], got)
+			for _, tc := range []struct {
+				prefix string
+				want   []Hash
+			}{
+				{"0", ids[:2]}, {"01", ids[:2]}, {"010", ids[:2]},
+				{"0100", ids[:1]}, {"0101", ids[1:2]}, {"0102", nil},
+				{"8", ids[2:3]}, {"f", ids[3:]}, {"FF", ids[3:]},
+				{ids[0].String(), ids[:1]}, {"7", nil},
+			} {
+				var matches []Hash
+				err := i.ForEachHashWithPrefix(tc.prefix, func(id Hash) bool {
+					matches = append(matches, id)
+					return true
+				})
+				require.NoError(t, err)
+				require.Equal(t, tc.want, matches, tc.prefix)
+			}
+			for _, prefix := range []string{"", "z", "0z", strings.Repeat("1", pack.Size()*2+1)} {
+				require.Error(t, i.ForEachHashWithPrefix(prefix, func(Hash) bool { return true }))
+			}
 			_, err = i.FindHash(77)
 			require.ErrorIs(t, err, ErrObjectNotFound)
 			_, err = i.FindOffset(NewHash(strings.Repeat("f", pack.Size()*2)))
@@ -120,6 +140,73 @@ func TestLazyIndex(t *testing.T) {
 			}
 			_, err = iter.Next()
 			require.ErrorIs(t, err, io.EOF)
+		}
+	}
+}
+
+type countedIndexFile struct {
+	testIndexFile
+	reads int
+}
+
+func (f *countedIndexFile) ReadAt(p []byte, off int64) (int, error) {
+	f.reads++
+	return f.testIndexFile.ReadAt(p, off)
+}
+
+// A million sorted IDs, evenly distributed over all fanout buckets, with no
+// reverse table. Only the header and requested IDs need to be read.
+func largePrefixIndex() ([]byte, Hash) {
+	const count = 1 << 20
+	pack := NewHash(strings.Repeat("c", 40))
+	data := make([]byte, 1032+count*28+40)
+	copy(data, []byte{255, 't', 'O', 'c', 0, 0, 0, 2})
+	for n := range 256 {
+		binary.BigEndian.PutUint32(data[8+n*4:], uint32(n+1)*(count/256))
+	}
+	for n := range count {
+		binary.BigEndian.PutUint32(data[1032+n*20:], uint32(n)<<12)
+	}
+	copy(data[len(data)-40:], pack.Bytes())
+	return data, pack
+}
+
+func TestIndexPrefixStopsEarly(t *testing.T) {
+	data, pack := largePrefixIndex()
+	file := &countedIndexFile{testIndexFile: indexFile(data), reads: 0}
+	idx, err := OpenIndex(t.Context(), file, nil, pack)
+	require.NoError(t, err)
+	defer idx.Close()
+	for _, prefix := range []string{"0", "a", "f", "abcd"} {
+		file.reads = 0
+		count := 0
+		err := idx.ForEachHashWithPrefix(prefix, func(id Hash) bool {
+			require.True(t, strings.HasPrefix(id.String(), prefix))
+			count++
+			return count < 2
+		})
+		require.NoError(t, err)
+		require.Equal(t, 2, count)
+		require.Less(t, file.reads, 32, "a broad revision prefix must not read the entire object table")
+	}
+}
+
+func BenchmarkIndexShortPrefix(b *testing.B) {
+	data, pack := largePrefixIndex()
+	idx, err := OpenIndex(b.Context(), indexFile(data), nil, pack)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer idx.Close()
+	b.ReportAllocs()
+	for b.Loop() {
+		count := 0
+		err := idx.ForEachHashWithPrefix("a", func(Hash) bool {
+			count++
+			return count < 2
+		})
+		if err != nil || count != 2 {
+			b.Fatalf("prefix lookup returned %d matches: %v", count, err)
 		}
 	}
 }
@@ -176,6 +263,7 @@ func FuzzIndex(f *testing.F) {
 		_, _ = i.FindOffset(pack)
 		_, _ = i.FindHash(12)
 		_, _ = i.HashesWithPrefix([]byte{0})
+		_ = i.ForEachHashWithPrefix("0", func(Hash) bool { return true })
 	})
 }
 
@@ -191,4 +279,5 @@ func TestIndexCancellation(t *testing.T) {
 	require.Nil(t, i.order)
 	_, err = i.HashesWithPrefix([]byte{1})
 	require.ErrorIs(t, err, context.Canceled)
+	require.ErrorIs(t, i.ForEachHashWithPrefix("0", func(Hash) bool { return true }), context.Canceled)
 }

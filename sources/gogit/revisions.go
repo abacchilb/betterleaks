@@ -15,9 +15,10 @@ import (
 
 type repositoryStorage interface {
 	gitobj.ObjectReader
+	ObjectType(id gitobj.Hash) (gitobj.ObjectType, error)
 	Reference(name gitobj.ReferenceName) (*gitobj.Reference, error)
 	IterReferences() (*gitobj.ReferenceIter, error)
-	HashesWithPrefix(prefix []byte) ([]gitobj.Hash, error)
+	ForEachHashWithPrefix(prefix string, yield func(gitobj.Hash) bool) error
 	Config() (*config.Config, error)
 }
 type repository struct{ Storer repositoryStorage }
@@ -80,6 +81,13 @@ func (r *repository) Tags() (*gitobj.ReferenceIter, error) {
 }
 func (r *repository) peelCommit(id gitobj.Hash) (*gitobj.Commit, error) {
 	for range maxTagNesting {
+		kind, err := r.Storer.ObjectType(id)
+		if err != nil {
+			return nil, err
+		}
+		if kind != gitobj.CommitObject && kind != gitobj.TagObject {
+			return nil, gitobj.ErrObjectNotFound
+		}
 		o, err := r.Storer.EncodedObject(gitobj.AnyObject, id)
 		if err != nil {
 			return nil, err
@@ -100,14 +108,15 @@ func (r *repository) peelCommit(id gitobj.Hash) (*gitobj.Commit, error) {
 	return nil, fmt.Errorf("annotated tag nesting exceeds %d levels", maxTagNesting)
 }
 func (r *repository) revisionBase(name string) (*gitobj.Commit, error) {
-	var ids []gitobj.Hash
 	cfg, err := r.Config()
 	if err != nil {
 		return nil, err
 	}
 	size := gitobj.FromObjectFormat(cfg.Extensions.ObjectFormat).Size()
 	if len(name) == size*2 && gitobj.IsHash(name) {
-		ids = append(ids, gitobj.NewHash(name))
+		// A full object ID is authoritative, including when it names a blob
+		// or missing object. A same-named branch must not substitute history.
+		return r.peelCommit(gitobj.NewHash(name))
 	} else if len(name) > 0 && len(name) < size*2 {
 		// Validate the dangling nibble too. Truncating it before decoding
 		// treats names like z or abz as possible object IDs, causing needless
@@ -116,29 +125,35 @@ func (r *repository) revisionBase(name string) (*gitobj.Commit, error) {
 		if len(name)%2 != 0 {
 			hexName += "0"
 		}
-		if prefix, err := hex.DecodeString(hexName); err == nil {
-			prefix = prefix[:len(name)/2]
-			candidates, err := r.Storer.HashesWithPrefix(prefix)
-			if err != nil {
-				return nil, err
-			}
-			gitobj.HashesSort(candidates)
-			for _, id := range candidates {
-				if strings.HasPrefix(id.String(), strings.ToLower(name)) {
-					ids = append(ids, id)
+		if _, err := hex.DecodeString(hexName); err == nil {
+			var candidate *gitobj.Commit
+			var candidateID gitobj.Hash
+			var resolveErr error
+			err := r.Storer.ForEachHashWithPrefix(strings.ToLower(name), func(id gitobj.Hash) bool {
+				if candidate != nil && id == candidateID {
+					return true
 				}
+				c, err := r.peelCommit(id)
+				if errors.Is(err, gitobj.ErrObjectNotFound) {
+					return true // Disambiguate commits and tags that peel to commits.
+				}
+				if err != nil {
+					resolveErr = err
+					return false
+				}
+				if candidate != nil {
+					resolveErr = fmt.Errorf("ambiguous revision %q", name)
+					return false
+				}
+				candidate, candidateID = c, id
+				return true
+			})
+			if err != nil || resolveErr != nil {
+				return nil, errors.Join(err, resolveErr)
 			}
-		}
-	}
-	// Object IDs take precedence over equally named refs. Resolve them before
-	// reading refs so a broken same-named branch cannot invalidate a valid ID.
-	for _, id := range ids {
-		c, err := r.peelCommit(id)
-		if err == nil {
-			return c, nil
-		}
-		if !errors.Is(err, gitobj.ErrObjectNotFound) {
-			return nil, err
+			if candidate != nil {
+				return candidate, nil
+			}
 		}
 	}
 	for _, pattern := range []string{"%s", "refs/%s", "refs/tags/%s", "refs/heads/%s", "refs/remotes/%s", "refs/remotes/%s/HEAD"} {

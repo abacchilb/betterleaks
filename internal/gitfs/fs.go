@@ -18,13 +18,18 @@ type Option func(*FS)
 
 func WithMmap() Option { return func(f *FS) { f.mmap = true } }
 
+// WithFilePool bounds the descriptors retained when mapping is unavailable.
+// A pool can be shared by filesystems rooted in different object directories.
+func WithFilePool(pool *FilePool) Option { return func(f *FS) { f.pool = pool } }
+
 type FS struct {
 	base string
 	mmap bool
+	pool *FilePool
 }
 
 func New(base string, opts ...Option) *FS {
-	f := &FS{base: base, mmap: false}
+	f := &FS{base: base, mmap: false, pool: nil}
 	for _, opt := range opts {
 		opt(f)
 	}
@@ -38,19 +43,34 @@ func (f *FS) OpenFile(name string, flag int, _ os.FileMode) (billy.File, error) 
 	if flag & ^NonBlocking != os.O_RDONLY {
 		return nil, os.ErrPermission
 	}
-	root, err := os.OpenRoot(f.base)
+	if f.pool != nil {
+		return f.pool.open(f, name)
+	}
+	return f.open(name)
+}
+
+func openRegular(base, name string) (*os.File, os.FileInfo, error) {
+	root, err := os.OpenRoot(base)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer root.Close()
 	file, err := root.OpenFile(name, os.O_RDONLY|NonBlocking, 0)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	info, err := file.Stat()
 	if err != nil || !info.Mode().IsRegular() {
 		file.Close()
-		return nil, errors.Join(err, errors.New("git storage is not a regular file"))
+		return nil, nil, errors.Join(err, errors.New("git storage is not a regular file"))
+	}
+	return file, info, nil
+}
+
+func (f *FS) open(name string) (*File, error) {
+	file, info, err := openRegular(f.base, name)
+	if err != nil {
+		return nil, err
 	}
 	result := &File{File: file, info: info} //nolint:exhaustruct // Mapping and close bookkeeping start empty.
 	if f.mmap && info.Size() > 0 && info.Size() <= int64(int(^uint(0)>>1)) {
@@ -126,7 +146,7 @@ func (f *FS) Chroot(name string) (billy.Filesystem, error) {
 		return nil, err
 	}
 	defer child.Close()
-	return &FS{base: child.Name(), mmap: f.mmap}, nil
+	return &FS{base: child.Name(), mmap: f.mmap, pool: f.pool}, nil
 }
 func (*FS) Create(string) (billy.File, error)           { return nil, os.ErrPermission }
 func (*FS) TempFile(string, string) (billy.File, error) { return nil, os.ErrPermission }

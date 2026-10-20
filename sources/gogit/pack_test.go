@@ -139,8 +139,11 @@ func TestPackedObjects(t *testing.T) {
 						require.Equal(t, want, entry.kind)
 					}
 					store.objects.Clear() // Exercise reconstruction, not an earlier cache hit.
+					kind, err := store.ObjectType(e.Hash)
+					require.NoError(t, err)
 					o, err := store.read(e.Hash)
 					require.NoError(t, err)
+					require.Equal(t, o.Type(), kind)
 					h := gitobj.NewHasher(objectFormat, o.Type(), o.Size())
 					h.Write([]byte(o.raw))
 					require.Equal(t, e.Hash, h.Sum())

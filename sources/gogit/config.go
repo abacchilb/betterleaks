@@ -17,11 +17,15 @@ import (
 // lookup and incompatible branch/URL semantics, so use stable gcfg's syntax
 // parser with indexed section lookup. This configuration is never written.
 func parseRepositoryConfig(raw string) (*config.Config, error) {
-	c := config.NewConfig()
 	decoded, err := decodeRepositoryConfig(raw)
 	if err != nil {
 		return nil, err
 	}
+	return projectRepositoryConfig(decoded)
+}
+
+func projectRepositoryConfig(decoded *format.Config) (*config.Config, error) {
+	c := config.NewConfig()
 	c.Raw = decoded
 	// Retain main's validation of settings outside the scanner's projection.
 	if window := decoded.Section("pack").Option("window"); window != "" {
@@ -62,6 +66,44 @@ func parseRepositoryConfig(raw string) (*config.Config, error) {
 	}
 	applyRepositoryURLRules(c)
 	return c, nil
+}
+
+// Worktree settings override individual shared keys, not whole remote/branch
+// entries. Retain every value for an overriding key and project URL rewrites
+// only after merging. Storage format and extension requirements remain shared.
+func mergeWorktreeConfig(shared, worktree *format.Config) {
+	mergeOptions := func(base, overlay format.Options) format.Options {
+		keys := make(map[string]bool, len(overlay))
+		for _, option := range overlay {
+			keys[strings.ToLower(option.Key)] = true
+		}
+		merged := base[:0]
+		for _, option := range base {
+			if !keys[strings.ToLower(option.Key)] {
+				merged = append(merged, option)
+			}
+		}
+		return append(merged, overlay...)
+	}
+	for _, name := range []string{"remote", "branch", "url"} {
+		if !worktree.HasSection(name) {
+			continue
+		}
+		base, overlay := shared.Section(name), worktree.Section(name)
+		base.Options = mergeOptions(base.Options, overlay.Options)
+		byName := make(map[string]*format.Subsection, len(base.Subsections))
+		for _, sub := range base.Subsections {
+			byName[sub.Name] = sub
+		}
+		for _, sub := range overlay.Subsections {
+			if existing := byName[sub.Name]; existing != nil {
+				existing.Options = mergeOptions(existing.Options, sub.Options)
+			} else {
+				base.Subsections = append(base.Subsections, sub)
+				byName[sub.Name] = sub
+			}
+		}
+	}
 }
 
 func decodeRepositoryConfig(raw string) (*format.Config, error) {

@@ -211,5 +211,5 @@ func readSmallFile(path string) (string, error) {
 }
 
 func storageFS(root string) readOnlyFS {
-	return readOnlyFS{Filesystem: gitfs.New(root), objectRoot: root}
+	return readOnlyFS{Filesystem: gitfs.New(root), objectRoot: root, pool: nil}
 }
