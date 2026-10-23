@@ -7562,7 +7562,7 @@ r.status == 200 && type(user) == "map" && (user?.id ?? "") != "" && len(r.json?.
       } : {}
     }
   }
-} : (r.status == 200 && type(r.json) == "map" && type(r.json?.data) == "map" && user == nil) || r.status == 401 ? {
+} : (r.status == 200 && type(r.json) == "map" && type(r.json?.data) == "map" && user == nil && len(r.json?.errors ?? []) == 0) || r.status == 401 ? {
   "result": "invalid", "reason": "Invalid, revoked, or expired API key"
 } : validate.unknown(r)
 '''

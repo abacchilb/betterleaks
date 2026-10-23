@@ -199,9 +199,11 @@ func TestAnalysisTargetsOptionalAndPartialResponses(t *testing.T) {
 			result, _ := runTargetFixture(t, rule, fixture, 200, `{"data":{"user":null}}`, false)
 			assert.Equal(t, report.ValidationStatusInvalid, result.Status)
 			assert.Empty(t, result.Analysis)
-			result, _ = runTargetFixture(t, rule, fixture, 200, `{"data":{"user":{"id":"lbx-user"}},"errors":[{"message":"denied"}]}`, false)
-			assert.Equal(t, report.ValidationStatusUnknown, result.Status)
-			assert.Empty(t, result.Analysis)
+			for _, body := range []string{`{"data":{"user":{"id":"lbx-user"}},"errors":[{"message":"denied"}]}`, `{"data":{"user":null},"errors":[{"message":"Internal server error"}]}`} {
+				result, _ = runTargetFixture(t, rule, fixture, 200, body, false)
+				assert.Equal(t, report.ValidationStatusUnknown, result.Status)
+				assert.Empty(t, result.Analysis)
+			}
 			_, analysis := runTargetFixture(t, rule, fixture, 200, `{"data":{"user":{"id":"lbx-user","organization":null}}}`, true)
 			assert.Equal(t, &report.AnalysisIdentity{ID: "lbx-user"}, analysis.Identity)
 		case "linear-api-key":
